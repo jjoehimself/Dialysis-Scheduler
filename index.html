@@ -62,6 +62,7 @@
                 <p id="boardMeta"></p>
               </div>
               <div class="board-actions">
+                <button class="primary-button" id="autoScheduleDay" type="button">生成周模板建议</button>
                 <button class="ghost-button" id="saveDayAsWeeklyTemplate" type="button">本日设为周模板</button>
                 <button class="ghost-button" id="copyPreviousDay" type="button">复制前一天</button>
                 <button class="danger-button" id="clearDay" type="button">清空当日</button>
@@ -121,6 +122,22 @@
                     </select>
                   </label>
                   <label>
+                    <span>常规治疗</span>
+                    <select id="patientTreatmentType">
+                      <option value="hemodialysis">血透</option>
+                      <option value="hemofiltration">血滤</option>
+                      <option value="perfusion">灌流</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>每周次数</span>
+                    <input id="weeklyTreatmentCount" type="number" min="1" max="6" value="3" />
+                  </label>
+                  <label>
+                    <span>每月血滤次数</span>
+                    <input id="monthlyHdfCount" type="number" min="0" max="4" value="1" />
+                  </label>
+                  <label>
                     <span>状态</span>
                     <select id="patientStatus">
                       <option value="active">在透</option>
@@ -129,7 +146,20 @@
                   </label>
                   <label>
                     <span>感染标识</span>
-                    <input id="infectionFlag" maxlength="32" autocomplete="off" placeholder="如 HBV/HCV/无" />
+                    <select id="infectionFlag">
+                      <option value="">无</option>
+                      <option value="HBC">HBC</option>
+                      <option value="HBV">HBV</option>
+                      <option value="HCV">HCV</option>
+                      <option value="T">T</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>护理组别</span>
+                    <select id="careLevel">
+                      <option value="standard">普通组</option>
+                      <option value="severe">严重组</option>
+                    </select>
                   </label>
                   <label>
                     <span>常用班次</span>
@@ -175,6 +205,7 @@
                       <th>姓名</th>
                       <th>透析号</th>
                       <th>通路</th>
+                      <th>治疗</th>
                       <th>班次</th>
                       <th>状态</th>
                       <th>操作</th>
@@ -312,21 +343,93 @@
                     <input id="rowCount" type="number" min="1" max="20" required />
                   </label>
                   <label>
-                    <span>机器编号前缀</span>
-                    <input id="machinePrefix" maxlength="8" placeholder="如 M" />
+                    <span>第一台从哪边开始</span>
+                    <select id="numberingStartSide">
+                      <option value="left">左边</option>
+                      <option value="right">右边</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>通用传染区名称</span>
+                    <input id="specialZoneName" maxlength="16" placeholder="如 传染区" />
                   </label>
                 </div>
                 <div class="form-actions">
                   <button class="primary-button" type="submit">应用布局</button>
-                  <button class="ghost-button" id="restoreDemo" type="button">填入默认</button>
+                  <button class="ghost-button" id="restoreDemo" type="button">恢复默认布局</button>
                 </div>
               </form>
+              <section class="demo-tools" aria-label="演示数据">
+                <div class="panel-header compact">
+                  <h3>演示数据</h3>
+                </div>
+                <div class="form-grid two">
+                  <label>
+                    <span>患者数量</span>
+                    <input id="demoPatientCount" type="number" min="0" max="300" value="36" />
+                  </label>
+                  <label>
+                    <span>医生数量</span>
+                    <input id="demoDoctorCount" type="number" min="0" max="50" value="4" />
+                  </label>
+                  <label>
+                    <span>护士数量</span>
+                    <input id="demoNurseCount" type="number" min="0" max="200" value="10" />
+                  </label>
+                  <label>
+                    <span>HBC 患者数量</span>
+                    <input id="demoHbcCount" type="number" min="0" max="300" value="2" />
+                  </label>
+                  <label>
+                    <span>HBV 患者数量</span>
+                    <input id="demoHbvCount" type="number" min="0" max="300" value="2" />
+                  </label>
+                  <label>
+                    <span>HCV 患者数量</span>
+                    <input id="demoHcvCount" type="number" min="0" max="300" value="1" />
+                  </label>
+                  <label>
+                    <span>T 患者数量</span>
+                    <input id="demoTCount" type="number" min="0" max="300" value="1" />
+                  </label>
+                  <label>
+                    <span>严重组患者数量</span>
+                    <input id="demoSevereCount" type="number" min="0" max="300" value="4" />
+                  </label>
+                  <label>
+                    <span>演示每月血滤次数</span>
+                    <input id="demoMonthlyHdfCount" type="number" min="0" max="4" value="1" />
+                  </label>
+                </div>
+                <div class="form-actions">
+                  <button class="primary-button" id="generateDemoData" type="button">生成演示数据</button>
+                  <button class="danger-button" id="clearDemoData" type="button">清除演示数据</button>
+                </div>
+              </section>
             </section>
 
             <section class="layout-preview">
               <div class="panel-header">
                 <h2>布局预览</h2>
-                <span id="layoutCountBadge" class="count-badge"></span>
+                <div class="preview-tools">
+                  <label>
+                    <span>点击设置</span>
+                    <select id="layoutEditMode">
+                      <option value="type:hemodialysis">设为血透</option>
+                      <option value="type:hemofiltration">设为血滤</option>
+                      <option value="type:perfusion">设为灌流</option>
+                      <option value="zone:normal">设为普通区</option>
+                      <option value="zone:severe">设为重病区</option>
+                      <option value="zone:infection">设为通用传染区</option>
+                      <option value="zone:HBC">设为 HBC 区</option>
+                      <option value="zone:HBV">设为 HBV 区</option>
+                      <option value="zone:HCV">设为 HCV 区</option>
+                      <option value="zone:T">设为 T 区</option>
+                      <option value="inactive">删除/恢复机位</option>
+                    </select>
+                  </label>
+                  <span id="layoutCountBadge" class="count-badge"></span>
+                </div>
               </div>
               <div id="layoutPreviewGrid" class="layout-preview-grid"></div>
             </section>

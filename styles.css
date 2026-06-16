@@ -470,6 +470,7 @@ main {
 
 .nurse-patient-list li span {
   display: inline-flex;
+  flex-wrap: wrap;
   justify-content: flex-start;
   color: var(--muted);
   font-weight: 700;
@@ -484,6 +485,16 @@ main {
   background: var(--accent-soft);
   font-size: 10px;
   font-style: normal;
+}
+
+.nurse-patient-list em.severe {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.nurse-patient-list em.infection {
+  color: #4d51a6;
+  background: #eceeff;
 }
 
 .nurse-patient-empty {
@@ -564,6 +575,12 @@ main {
   background: #eef1f6;
 }
 
+.tag.demo {
+  margin-left: 6px;
+  color: #4d51a6;
+  background: #eceeff;
+}
+
 .machine-board {
   min-width: 0;
   padding: 16px;
@@ -612,19 +629,59 @@ main {
   display: grid;
   grid-template-columns: repeat(var(--machines-per-row), minmax(152px, 1fr));
   gap: 10px;
+  align-items: stretch;
 }
 
 .machine-card {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  height: 100%;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel-soft);
   overflow: hidden;
 }
 
-.machine-card.filtration {
+.machine-card.machine-type-hemodialysis {
+  border-color: rgba(47, 111, 109, 0.28);
+}
+
+.machine-card.machine-type-hemofiltration {
   border-color: rgba(143, 95, 42, 0.42);
   background: #fff8ed;
+}
+
+.machine-card.machine-type-perfusion {
+  border-color: rgba(83, 88, 172, 0.36);
+  background: #f5f6ff;
+}
+
+.machine-card.special {
+  border-color: rgba(180, 35, 24, 0.34);
+}
+
+.machine-card.machine-zone-severe {
+  border-color: rgba(180, 35, 24, 0.46);
+}
+
+.machine-card.machine-zone-infection,
+.machine-card.machine-zone-hbc,
+.machine-card.machine-zone-hbv,
+.machine-card.machine-zone-hcv,
+.machine-card.machine-zone-t {
+  border-color: rgba(126, 70, 142, 0.4);
+}
+
+.inactive-machine-slot {
+  display: grid;
+  min-height: 144px;
+  place-items: center;
+  border-style: dashed;
+  color: var(--muted);
+  background: #f7f8f8;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .machine-card-header {
@@ -648,8 +705,7 @@ main {
   gap: 6px;
 }
 
-.machine-type-badge,
-.machine-type-toggle {
+.machine-type-badge {
   display: inline-flex;
   align-items: center;
   min-height: 24px;
@@ -660,25 +716,60 @@ main {
 
 .machine-type-badge {
   padding: 3px 8px;
-  color: var(--warning);
-  background: var(--accent-soft);
-}
-
-.machine-type-toggle {
-  padding: 3px 8px;
-  border: 1px solid var(--line-strong);
   color: var(--primary-dark);
-  background: #fff;
+  background: var(--primary-soft);
 }
 
-.machine-type-toggle:hover {
-  border-color: var(--accent);
+.machine-type-badge.machine-type-hemofiltration {
   color: var(--warning);
   background: var(--accent-soft);
+}
+
+.machine-type-badge.machine-type-perfusion {
+  color: #4d51a6;
+  background: #eceeff;
+}
+
+.machine-type-badge.special {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.machine-type-badge.machine-zone-severe {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.machine-type-badge.machine-zone-infection {
+  color: #7b3f83;
+  background: #f4e8f7;
+}
+
+.machine-type-badge.machine-zone-hbc {
+  color: #895900;
+  background: #fff1ce;
+}
+
+.machine-type-badge.machine-zone-hbv {
+  color: #8f4b2a;
+  background: #ffe8dc;
+}
+
+.machine-type-badge.machine-zone-hcv {
+  color: #4d51a6;
+  background: #eceeff;
+}
+
+.machine-type-badge.machine-zone-t {
+  color: #146c5f;
+  background: #dff4ee;
 }
 
 .slot-stack {
   display: grid;
+  flex: 1;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
   gap: 8px;
   padding: 10px;
 }
@@ -687,6 +778,7 @@ main {
   display: flex;
   flex-direction: column;
   width: 100%;
+  height: 100%;
   min-height: 74px;
   justify-content: flex-start;
   align-items: stretch;
@@ -727,6 +819,18 @@ main {
   color: var(--primary);
   font-size: 12px;
   font-weight: 700;
+}
+
+.slot-nurse {
+  align-self: flex-start;
+  margin-bottom: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #255a57;
+  background: rgba(47, 111, 109, 0.12);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.4;
 }
 
 .slot-empty {
@@ -830,6 +934,39 @@ label span {
   margin-bottom: 14px;
 }
 
+.demo-tools {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.panel-header.compact {
+  margin-bottom: 12px;
+}
+
+.panel-header.compact h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 100%;
+  padding-top: 21px;
+}
+
+.checkbox-row input {
+  width: auto;
+  min-height: auto;
+}
+
+.checkbox-row span {
+  margin: 0;
+  color: var(--ink);
+}
+
 .form-actions {
   justify-content: space-between;
   gap: 10px;
@@ -886,6 +1023,23 @@ label span {
   gap: 8px;
 }
 
+.preview-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.preview-tools label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-tools label span {
+  margin: 0;
+  white-space: nowrap;
+}
+
 .preview-machine {
   display: grid;
   gap: 2px;
@@ -899,10 +1053,64 @@ label span {
   font-weight: 800;
 }
 
-.preview-machine.filtration {
+.preview-machine.machine-type-hemofiltration {
   border-color: rgba(143, 95, 42, 0.42);
   color: var(--warning);
   background: var(--accent-soft);
+}
+
+.preview-machine.machine-type-perfusion {
+  border-color: rgba(83, 88, 172, 0.36);
+  color: #4d51a6;
+  background: #eceeff;
+}
+
+.preview-machine.special {
+  border-color: rgba(180, 35, 24, 0.34);
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.preview-machine.machine-zone-severe {
+  border-color: rgba(180, 35, 24, 0.36);
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.preview-machine.machine-zone-infection {
+  border-color: rgba(126, 70, 142, 0.36);
+  color: #7b3f83;
+  background: #f4e8f7;
+}
+
+.preview-machine.machine-zone-hbc {
+  border-color: rgba(137, 89, 0, 0.34);
+  color: #895900;
+  background: #fff1ce;
+}
+
+.preview-machine.machine-zone-hbv {
+  border-color: rgba(143, 75, 42, 0.34);
+  color: #8f4b2a;
+  background: #ffe8dc;
+}
+
+.preview-machine.machine-zone-hcv {
+  border-color: rgba(83, 88, 172, 0.34);
+  color: #4d51a6;
+  background: #eceeff;
+}
+
+.preview-machine.machine-zone-t {
+  border-color: rgba(20, 108, 95, 0.34);
+  color: #146c5f;
+  background: #dff4ee;
+}
+
+.preview-machine.inactive {
+  border-style: dashed;
+  color: var(--muted);
+  background: #f7f8f8;
 }
 
 .preview-machine small {
@@ -1098,7 +1306,6 @@ label span {
   .tabs,
   .week-board,
   .board-actions,
-  .machine-type-toggle,
   .summary-grid,
   .toast {
     display: none !important;
