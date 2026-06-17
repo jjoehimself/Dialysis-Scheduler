@@ -1,3 +1,115 @@
+# 血透室本地排班系统
+
+## 全免费 · 全开源 · 全本地 · 超简单
+
+一款面向血液透析中心的本地排班辅助软件。
+
+本项目完全免费、完全开源，无需安装服务器，无需部署数据库，也不需要联网使用。
+
+你只需要下载项目中的全部文件，将它们放在同一个文件夹内，然后双击运行 `index.html`，即可开始使用。
+
+患者资料、医护资料、机器布局、排班模板和日常调整数据，全部保存在当前电脑的浏览器本地，不会自动上传到任何服务器。
+
+系统支持：
+
+* 患者长期固定机位
+* 患者优先、医护优先和灵巧排班
+* 上午、下午独立排班
+* 血透、血滤、灌流机型严格区分
+* 普通区、重病区和传染病区隔离
+* 重病区每5名患者配置1名护士
+* 其他区域每6名患者配置1名护士
+* 每名护士最多负责1台血滤机
+* 护士责任管区禁止跨越不同机器排
+* 机器故障暂停和临时调整
+* 长期周模板和单日调整
+* 护士负担均衡
+* 灵巧透析日组合优化
+* 自动安全检查和错误提示
+* 多语言界面
+* 本地数据导入、导出和备份
+
+作者本人是一名透析患者。
+
+本项目希望在保证安全规则和人工复核的前提下，帮助血透中心减少重复操作，提高排班效率，让患者更容易找到固定机位，也让医护人员的工作安排更加清晰和均衡。
+
+本程序完全开源，完全免费。
+
+感谢世界上所有的医护人员，希望你们每天都开开心心，健健康康。
+
+如有功能需求、使用建议或问题反馈，欢迎联系：
+
+**[434881918@qq.com](mailto:434881918@qq.com)**
+
+作者：**卓韵**
+
+---
+
+# Hemodialysis Room Local Scheduler
+
+## Completely Free · Fully Open Source · 100% Local · Easy to Use
+
+A local scheduling-assistance system designed for hemodialysis centers.
+
+This project is completely free and fully open source. It requires no server installation, no database deployment, and no internet connection.
+
+Simply download all project files, place them in the same folder, and double-click `index.html` to start using the system.
+
+Patient records, staff information, machine layouts, recurring weekly templates, and date-specific schedule adjustments are stored locally in the browser on the current computer. No data is automatically uploaded to any server.
+
+The system supports:
+
+* Long-term fixed machine positions for patients
+* Patient Priority, Staff Priority, and Smart Scheduling modes
+* Separate morning and afternoon scheduling
+* Strict separation of hemodialysis, hemofiltration, and hemoperfusion machines
+* Isolation of standard, severe-care, and infectious-disease zones
+* One nurse for every 5 severe-care patients
+* One nurse for every 6 patients in other zones
+* No more than one hemofiltration machine per nurse
+* Nurse responsibility zones that never cross physical machine rows
+* Machine pause and failure handling
+* Recurring weekly templates and date-specific adjustments
+* Balanced nurse workloads
+* Flexible and safe treatment-day pattern optimization
+* Automatic safety checks and error warnings
+* Multilingual interface
+* Local data import, export, and backup
+
+The author is a dialysis patient.
+
+This project aims to help hemodialysis centers reduce repetitive work, improve scheduling efficiency, make fixed patient positions easier to manage, and create clearer and more balanced workloads for healthcare staff, while preserving mandatory safety rules and manual review.
+
+This program is fully open source and completely free.
+
+Thank you to all healthcare workers around the world. May you be happy and healthy every day.
+
+For feature requests, suggestions, or issue reports, please contact:
+
+**[434881918@qq.com](mailto:434881918@qq.com)**
+
+Author: **Zhuo Yun**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # 血透室排班系统
 
 **版本：2026.06.17.2（全面修复版）**
