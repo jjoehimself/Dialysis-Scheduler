@@ -1,5 +1,5 @@
 const STORAGE_KEY = "hemodialysis-scheduler-v1";
-const APP_VERSION = "2026.06.17.29";
+const APP_VERSION = "2026.06.18.19";
 const SHIFT_LABELS = {
   morning: "上午",
   afternoon: "下午",
@@ -11,6 +11,9 @@ const DEFAULT_LAYOUT_PRESET_VERSION = "default-60-machine-layout-v1";
 const SCHEDULE_PRIORITY_PATIENT = "patient";
 const SCHEDULE_PRIORITY_STAFF = "staff";
 const SCHEDULE_PRIORITY_SMART = "smart";
+const STAFF_WORK_MODE_BALANCED = "balanced";
+const STAFF_WORK_MODE_FULL_DAY = "full_day";
+const STAFF_WORK_MODE_REST_MAX = "rest_max";
 const DOCTOR_COUNT = 2;
 const MACHINES_PER_NURSE = 6;
 const SEVERE_PATIENT_NURSE_CAPACITY = 5;
@@ -121,6 +124,25 @@ function normalizeSchedulePriority(value) {
     : SCHEDULE_PRIORITY_PATIENT;
 }
 
+function normalizeStaffWorkMode(value) {
+  return [STAFF_WORK_MODE_BALANCED, STAFF_WORK_MODE_FULL_DAY, STAFF_WORK_MODE_REST_MAX].includes(value)
+    ? value
+    : STAFF_WORK_MODE_BALANCED;
+}
+
+function normalizeEvenHdfCount(value, fallback = 2) {
+  const safeFallback = [0, 2, 4].includes(Number(fallback)) ? Number(fallback) : 2;
+  const count = clampNumber(value, 0, 4, safeFallback);
+  if (count <= 0) return 0;
+  return count >= 4 ? 4 : 2;
+}
+
+function getStaffWorkModeLabel(value = state?.settings?.staffWorkMode) {
+  const mode = normalizeStaffWorkMode(value);
+  if (mode === STAFF_WORK_MODE_REST_MAX) return "休息最大化";
+  return mode === STAFF_WORK_MODE_FULL_DAY ? "整日优先" : "均衡轮班";
+}
+
 function isFlexibleDayPriority(priority) {
   return priority === SCHEDULE_PRIORITY_SMART || priority === SCHEDULE_PRIORITY_STAFF;
 }
@@ -130,8 +152,9 @@ function isCompactResourcePriority(priority) {
 }
 
 function getSchedulePriorityLabel(priority = state?.settings?.schedulePriority) {
-  if (priority === SCHEDULE_PRIORITY_SMART) return "灵巧排班";
-  if (priority === SCHEDULE_PRIORITY_STAFF) return "医护优先";
+  const normalizedPriority = normalizeSchedulePriority(priority);
+  if (normalizedPriority === SCHEDULE_PRIORITY_SMART) return "灵巧排班";
+  if (normalizedPriority === SCHEDULE_PRIORITY_STAFF) return "医护优先";
   return "患者优先";
 }
 
@@ -191,6 +214,7 @@ const DEFAULT_STATE = {
     inactiveSlots: [],
     pausedMachines: [],
     schedulePriority: SCHEDULE_PRIORITY_PATIENT,
+    staffWorkMode: STAFF_WORK_MODE_BALANCED,
     machineTypes: { ...DEFAULT_LAYOUT_MACHINE_TYPES },
     machineZones: { ...DEFAULT_LAYOUT_MACHINE_ZONES },
     specialMachines: [...DEFAULT_LAYOUT_INFECTION_MACHINES],
@@ -203,6 +227,13 @@ const DEFAULT_STATE = {
   schedules: {},
   weeklyStaffSchedules: {},
   staffSchedules: {},
+  twoWeekCycle: {
+    patientSchedules: { week1: {}, week2: {} },
+    staffSchedules: { week1: {}, week2: {} },
+    review: null,
+    savedAt: "",
+    anchorWeekStart: "",
+  },
 };
 
 let didMigrateStoredLayout = false;
@@ -210,6 +241,9 @@ let storageRecoveryMessage = "";
 const state = loadState();
 const ui = {};
 let selectedSlot = null;
+let activeCycleWeek = 1;
+let pendingTwoWeekPlan = null;
+let pendingTwoWeekResolver = null;
 let toastTimer = null;
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -222,6 +256,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   bindEvents();
   ensureDate();
+  syncActiveCycleWeekFromDate();
   renderAll();
   if (storageRecoveryMessage) {
     showToast(storageRecoveryMessage);
@@ -242,6 +277,19 @@ function bindElements() {
     "nextWeek",
     "todayButton",
     "weekDayStrip",
+    "generateTwoWeekPlan",
+    "openInsertPatientTop",
+    "openInsertPatient",
+    "saveTwoWeekTemplate",
+    "openTwoWeekReview",
+    "cycleWeekTabs",
+    "twoWeekReviewDialog",
+    "twoWeekReviewTitle",
+    "twoWeekReviewMeta",
+    "twoWeekReviewContent",
+    "closeTwoWeekReview",
+    "printTwoWeekReview",
+    "confirmTwoWeekPlan",
     "staffTitle",
     "staffMeta",
     "staffScheduleScope",
@@ -251,10 +299,18 @@ function bindElements() {
     "machineRows",
     "schedulePriority",
     "schedulePriorityLabel",
-    "autoScheduleDay",
-    "copyPreviousDay",
-    "saveDayAsWeeklyTemplate",
-    "clearDay",
+    "staffWorkMode",
+    "staffWorkModeLabel",
+    
+    "scheduleReviewDialog",
+    "scheduleReviewTitle",
+    "scheduleReviewMeta",
+    "scheduleReviewContent",
+    "closeScheduleReview",
+    "printScheduleReview",
+    "confirmScheduleReview",
+    
+    
     "printSchedule",
     "exportData",
     "importData",
@@ -289,6 +345,7 @@ function bindElements() {
     "preferredShift",
     "patientFixedMachine",
     "patientPreferredDays",
+    "forcePreferredDays",
     "patientNote",
     "deletePatient",
     "patientSearch",
@@ -338,6 +395,9 @@ function bindElements() {
     "assignmentScope",
     "removeAssignment",
     "saveAssignment",
+    "insertPatientDialog",
+    "insertPatientForm",
+    "closeInsertPatientDialog",
     "toast",
   ];
   requiredIds.forEach((id) => {
@@ -393,18 +453,36 @@ function bindEvents() {
     ui[id].addEventListener("input", renderLayoutPreviewFromForm);
   });
   ui.numberingStartSide.addEventListener("change", renderLayoutPreviewFromForm);
-
-  ui.copyPreviousDay.addEventListener("click", copyPreviousDay);
   ui.schedulePriority.addEventListener("change", saveSchedulePriority);
-  ui.autoScheduleDay.addEventListener("click", autoScheduleWeeklyTemplate);
-  ui.saveDayAsWeeklyTemplate.addEventListener("click", saveCurrentWeekAsWeeklyTemplate);
-  ui.clearDay.addEventListener("click", clearCurrentDay);
-  ui.prevWeek.addEventListener("click", () => moveWeek(-1));
-  ui.nextWeek.addEventListener("click", () => moveWeek(1));
-  ui.todayButton.addEventListener("click", () => {
-    ui.scheduleDate.value = formatDateInput(new Date());
-    refreshScheduleView();
+  ui.staffWorkMode.addEventListener("change", saveStaffWorkMode);
+  ui.generateTwoWeekPlan.addEventListener("click", generateTwoWeekPlan);
+  ui.openInsertPatientTop.addEventListener("click", openInsertPatientDialog);
+  ui.openInsertPatient.addEventListener("click", openInsertPatientDialog);
+  ui.saveTwoWeekTemplate.addEventListener("click", saveTwoWeekCycleTemplate);
+  ui.openTwoWeekReview.addEventListener("click", openStoredTwoWeekReview);
+  ui.closeTwoWeekReview.addEventListener("click", () => closeTwoWeekReview(false));
+  ui.confirmTwoWeekPlan.addEventListener("click", () => closeTwoWeekReview(true));
+  ui.twoWeekReviewContent.addEventListener("click", handleTwoWeekReviewContentClick);
+  ui.printTwoWeekReview.addEventListener("click", printTwoWeekReview);
+  ui.twoWeekReviewDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeTwoWeekReview(false);
   });
+  ui.cycleWeekTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-week-offset]");
+    if (!button) return;
+    setDisplayWeekOffset(Number(button.dataset.weekOffset));
+  });
+  ui.closeScheduleReview.addEventListener("click", () => closeScheduleReview(false));
+  ui.confirmScheduleReview.addEventListener("click", () => closeScheduleReview(true));
+  ui.printScheduleReview.addEventListener("click", printScheduleReview);
+  ui.scheduleReviewDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeScheduleReview(false);
+  });
+  ui.prevWeek.addEventListener("click", () => setDisplayWeekOffset(0));
+  ui.nextWeek.addEventListener("click", () => setDisplayWeekOffset(1));
+  ui.todayButton.addEventListener("click", () => setDisplayWeekOffset(0, true));
   ui.printSchedule.addEventListener("click", () => window.print());
   ui.exportData.addEventListener("click", exportData);
   ui.importData.addEventListener("change", importData);
@@ -420,7 +498,16 @@ function bindEvents() {
     }
     saveAssignment();
   });
+  ui.assignmentForm.querySelectorAll("[data-assignment-cancel]").forEach((button) => {
+    button.addEventListener("click", () => ui.assignmentDialog.close());
+  });
   ui.removeAssignment.addEventListener("click", removeAssignment);
+  ui.insertPatientForm.addEventListener("submit", handleInsertPatientSubmit);
+  ui.closeInsertPatientDialog.addEventListener("click", closeInsertPatientDialog);
+  ui.insertPatientForm.querySelectorAll("[data-insert-cancel]").forEach((button) => {
+    button.addEventListener("click", closeInsertPatientDialog);
+  });
+  getInsertFormField("treatmentType")?.addEventListener("change", syncInsertMonthlyHdfAvailability);
 }
 
 function loadState() {
@@ -489,9 +576,11 @@ function normalizeState(input) {
   settings.inactiveSlots = normalizeInactiveSlots(settings.inactiveSlots, settings);
   settings.pausedMachines = normalizeMachineIdList(settings.pausedMachines, new Set(getMachineIds(settings)));
   settings.schedulePriority = normalizeSchedulePriority(settings.schedulePriority);
+  settings.staffWorkMode = normalizeStaffWorkMode(settings.staffWorkMode);
   settings.specialZoneName = String(settings.specialZoneName || DEFAULT_STATE.settings.specialZoneName).trim().slice(0, 16);
   settings.machineTypes = normalizeMachineTypeMap(settings.machineTypes, new Set(getMachineIds(settings)), settings.hdfMachines);
   settings.machineZones = normalizeMachineZoneMap(settings.machineZones, new Set(getMachineIds(settings)), settings.specialMachines);
+  settings.machineZones = restoreDefaultInfectionSubzonesIfCollapsed(settings.machineZones, settings);
   settings.specialMachines = getInfectionMachineIds(settings);
   delete settings.hdfMachines;
   settings.language = normalizeLanguageCode(settings.language);
@@ -501,14 +590,25 @@ function normalizeState(input) {
   const patientMap = new Map(patients.map((patient) => [patient.id, patient]));
   const validMachineIds = new Set(getMachineIds(settings));
 
+  const weeklySchedules = normalizeScheduleCollection(input.weeklySchedules, true, patientMap, validMachineIds);
+  const weeklyStaffSchedules = normalizeStaffSchedules(input.weeklyStaffSchedules, settings, true);
+
   return {
     settings,
     patients,
     staffMembers,
-    weeklySchedules: normalizeScheduleCollection(input.weeklySchedules, true, patientMap, validMachineIds),
+    weeklySchedules,
     schedules: normalizeScheduleCollection(input.schedules, false, patientMap, validMachineIds),
-    weeklyStaffSchedules: normalizeStaffSchedules(input.weeklyStaffSchedules, settings, true),
+    weeklyStaffSchedules,
     staffSchedules: normalizeStaffSchedules(input.staffSchedules, settings, false),
+    twoWeekCycle: normalizeTwoWeekCycle(
+      input.twoWeekCycle,
+      patientMap,
+      validMachineIds,
+      settings,
+      weeklySchedules,
+      weeklyStaffSchedules,
+    ),
   };
 }
 
@@ -519,7 +619,7 @@ function normalizePatient(patient) {
 
   const treatmentType = normalizeMachineType(patient.treatmentType);
   const monthlyHdfCount = treatmentType === DEFAULT_MACHINE_TYPE
-    ? clampNumber(patient.monthlyHdfCount, 0, 4, 1)
+    ? normalizeEvenHdfCount(patient.monthlyHdfCount, 2)
     : 0;
 
   return {
@@ -541,11 +641,93 @@ function normalizePatient(patient) {
     fixedMachineId: String(patient.fixedMachineId || "").trim().slice(0, 32),
     fixedMachineLockedAt: patient.fixedMachineId ? String(patient.fixedMachineLockedAt || patient.updatedAt || new Date().toISOString()) : "",
     preferredDays: normalizeDayPreference(patient.preferredDays),
+    forcePreferredDays: Boolean(patient.forcePreferredDays),
+    temporaryInsert: Boolean(patient.temporaryInsert),
     note: String(patient.note || "").trim().slice(0, 300),
     demo: Boolean(patient.demo),
     updatedAt: patient.updatedAt || new Date().toISOString(),
   };
 }
+
+
+function isSchedulablePatient(patient) {
+  return Boolean(
+    patient &&
+    String(patient.name || "").trim() &&
+    patient.status !== "paused" &&
+    !patient.temporaryInsert &&
+    clampNumber(patient.weeklyTreatmentCount, 1, 6, 3) > 0
+  );
+}
+
+function getSchedulablePatients() {
+  return state.patients.filter(isSchedulablePatient);
+}
+
+function getDefaultDialysisDaysForPatient(patient, patientIndex = 0, priority = state.settings.schedulePriority) {
+  const frequency = clampNumber(patient.weeklyTreatmentCount, 1, 6, 3);
+  if (frequency === 3) {
+    const patterns = isFlexibleDayPriority(priority)
+      ? SAFE_THRICE_WEEKLY_PATTERNS
+      : DEMO_DAY_PATTERNS;
+    return [...(patterns[patientIndex % patterns.length] || ["1", "3", "5"])];
+  }
+  if (frequency === 2) {
+    return patientIndex % 2 ? ["2", "5"] : ["1", "4"];
+  }
+  if (frequency === 1) {
+    return [WORKING_DAY_KEYS[patientIndex % WORKING_DAY_KEYS.length]];
+  }
+  return getStaffPriorityDayPattern(frequency).slice(0, frequency);
+}
+
+function hasForcedPreferredDays(patient) {
+  return Boolean(patient?.forcePreferredDays);
+}
+
+function validateForcedPreferredDaysPatients(patients = getSchedulablePatients()) {
+  const problems = [];
+  patients.filter(hasForcedPreferredDays).forEach((patient) => {
+    const frequency = clampNumber(patient.weeklyTreatmentCount, 1, 6, 3);
+    const selected = normalizeDayPreference(patient.preferredDays);
+    const workingSelected = selected.filter((dayKey) => WORKING_DAY_KEYS.includes(dayKey));
+
+    if (!selected.length) {
+      problems.push(`强制个性化：${patient.name} 已开启强制个性化，但没有勾选透析星期。请勾选 ${frequency} 个工作日。`);
+      return;
+    }
+
+    if (selected.includes(REST_DAY_KEY)) {
+      problems.push(`强制个性化：${patient.name} 勾选了周日，但周日为休息日，不能自动排班。请改选周一至周六。`);
+    }
+
+    if (workingSelected.length !== frequency) {
+      problems.push(`强制个性化：${patient.name} 每周需要 ${frequency} 次透析，但当前勾选了 ${workingSelected.length} 个工作日。请刚好勾选 ${frequency} 个工作日。`);
+    }
+  });
+  return problems;
+}
+
+function ensureDefaultDialysisDaysForSchedulablePatients(priority = state.settings.schedulePriority) {
+  const notices = [];
+  getSchedulablePatients().forEach((patient, patientIndex) => {
+    const normalizedDays = normalizeDayPreference(patient.preferredDays);
+    if (hasForcedPreferredDays(patient)) {
+      patient.preferredDays = normalizedDays;
+      return;
+    }
+    if (normalizedDays.length) {
+      patient.preferredDays = normalizedDays;
+      return;
+    }
+
+    patient.preferredDays = getDefaultDialysisDaysForPatient(patient, patientIndex, priority);
+    patient.updatedAt = new Date().toISOString();
+    notices.push(`${patient.name} 未设置星期，已按每周 ${patient.weeklyTreatmentCount || 3} 次自动分配到 ${patient.preferredDays.map(getWeekDayLabel).join("、")}`);
+  });
+  return notices;
+}
+
 
 function normalizeStaffMember(staff) {
   if (!staff || typeof staff !== "object" || !String(staff.name || "").trim()) {
@@ -867,8 +1049,43 @@ function normalizeMachineZoneMap(value, validMachines, legacySpecialMachines = [
   return result;
 }
 
+function restoreDefaultInfectionSubzonesIfCollapsed(machineZones = {}, settings = DEFAULT_STATE.settings) {
+  const result = { ...(machineZones || {}) };
+  const defaultInfectionIds = DEFAULT_LAYOUT_INFECTION_MACHINES.map(String);
+  const isDefaultGeometry =
+    Number(settings.rowCount) === Number(DEFAULT_STATE.settings.rowCount) &&
+    Number(settings.machinesPerRow) === Number(DEFAULT_STATE.settings.machinesPerRow) &&
+    String(settings.numberingStartSide || "left") === String(DEFAULT_STATE.settings.numberingStartSide || "left") &&
+    normalizeInactiveSlots(settings.inactiveSlots, settings).length === 0;
+  const allCollapsed = defaultInfectionIds.every((machineId) => result[machineId] === MACHINE_ZONE_INFECTION);
+  const hasSpecificInfectionZone = defaultInfectionIds.some((machineId) =>
+    MACHINE_ZONE_INFECTION_FLAGS.includes(result[machineId])
+  );
+
+  if (isDefaultGeometry && allCollapsed && !hasSpecificInfectionZone) {
+    defaultInfectionIds.forEach((machineId) => {
+      result[machineId] = DEFAULT_LAYOUT_MACHINE_ZONES[machineId] || MACHINE_ZONE_INFECTION;
+    });
+    didMigrateStoredLayout = true;
+  }
+
+  return result;
+}
+
 function normalizeCareLevel(value) {
   return String(value || "").trim() === SEVERE_CARE_LEVEL ? SEVERE_CARE_LEVEL : STANDARD_CARE_LEVEL;
+}
+
+function isSeverePatient(patient) {
+  return normalizeCareLevel(patient?.careLevel) === SEVERE_CARE_LEVEL;
+}
+
+function isInfectiousPatient(patient) {
+  return Boolean(normalizeInfectionFlag(patient?.infectionFlag));
+}
+
+function getPatientCareLabel(patient) {
+  return isSeverePatient(patient) ? "严重组" : "普通组";
 }
 
 function normalizeInfectionFlag(value) {
@@ -911,6 +1128,7 @@ function renderHeader() {
 }
 
 function refreshScheduleView() {
+  syncActiveCycleWeekFromDate();
   renderWeekNavigation();
   renderStaffSchedule();
   renderSchedule();
@@ -923,8 +1141,15 @@ function renderWeekNavigation() {
   const currentDate = parseDateInput(getCurrentDate());
   const weekStart = getWeekStart(currentDate);
   const weekEnd = addDays(weekStart, 6);
-  ui.weekTitle.textContent = `${formatShortDate(weekStart)} - ${formatShortDate(weekEnd)} ${!isChineseLanguage() ? "Week" : "周排班"}`;
-  ui.weekMeta.textContent = text.weekMeta;
+  const displayOffset = getDisplayWeekOffsetForDate(getCurrentDate());
+  const displayLabel = getDisplayWeekLabel(displayOffset);
+  ui.weekTitle.textContent = !isChineseLanguage()
+    ? `${displayLabel} ${formatShortDate(weekStart)} - ${formatShortDate(weekEnd)} Schedule`
+    : `${displayLabel} ${formatShortDate(weekStart)} - ${formatShortDate(weekEnd)} 周排班`;
+  ui.weekMeta.textContent = hasTwoWeekCycleTemplate()
+    ? `${displayLabel}使用长期2周循环第${activeCycleWeek}周模板；日期按本周、下周滚动显示，2周后会自动继续套用下一轮。`
+    : text.weekMeta;
+  updateCycleWeekChrome();
 
   ui.weekDayStrip.innerHTML = WEEK_DAYS.map((day, index) => {
     const date = addDays(weekStart, index);
@@ -958,13 +1183,1726 @@ function renderWeekNavigation() {
   });
 }
 
+
+
+function normalizeTwoWeekCycle(
+  input,
+  patientMap,
+  validMachineIds,
+  settings,
+  fallbackWeeklySchedules = {},
+  fallbackWeeklyStaffSchedules = {},
+) {
+  const safe = input && typeof input === "object" ? input : {};
+  const normalizeWeek = (week) =>
+    normalizeScheduleCollection(week && typeof week === "object" ? week : {}, true, patientMap, validMachineIds);
+  const normalizeStaffWeek = (week) =>
+    normalizeStaffSchedules(week && typeof week === "object" ? week : {}, settings, true);
+
+  let week1 = normalizeWeek(safe.patientSchedules?.week1);
+  let week2 = normalizeWeek(safe.patientSchedules?.week2);
+  let staffWeek1 = normalizeStaffWeek(safe.staffSchedules?.week1);
+  let staffWeek2 = normalizeStaffWeek(safe.staffSchedules?.week2);
+
+  const fallbackPatients = normalizeWeek(fallbackWeeklySchedules);
+  const fallbackStaff = normalizeStaffWeek(fallbackWeeklyStaffSchedules);
+  if (!Object.keys(week1).length && !Object.keys(week2).length && Object.keys(fallbackPatients).length) {
+    week1 = structuredClone(fallbackPatients);
+    week2 = structuredClone(fallbackPatients);
+  } else if (Object.keys(week1).length && !Object.keys(week2).length) {
+    week2 = structuredClone(week1);
+  } else if (!Object.keys(week1).length && Object.keys(week2).length) {
+    week1 = structuredClone(week2);
+  }
+
+  if (!Object.keys(staffWeek1).length && !Object.keys(staffWeek2).length && Object.keys(fallbackStaff).length) {
+    staffWeek1 = structuredClone(fallbackStaff);
+    staffWeek2 = structuredClone(fallbackStaff);
+  } else if (Object.keys(staffWeek1).length && !Object.keys(staffWeek2).length) {
+    staffWeek2 = structuredClone(staffWeek1);
+  } else if (!Object.keys(staffWeek1).length && Object.keys(staffWeek2).length) {
+    staffWeek1 = structuredClone(staffWeek2);
+  }
+
+  return {
+    patientSchedules: { week1, week2 },
+    staffSchedules: { week1: staffWeek1, week2: staffWeek2 },
+    review: safe.review && typeof safe.review === "object" ? safe.review : null,
+    savedAt: String(safe.savedAt || ""),
+    anchorWeekStart: normalizeCycleAnchorWeekStart(safe.anchorWeekStart || safe.savedAt),
+  };
+}
+
+function normalizeCycleAnchorWeekStart(value) {
+  const text = String(value || "").slice(0, 10);
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) {
+    return formatDateInput(getWeekStart(parseDateInput(text)));
+  }
+  return formatDateInput(getWeekStart(new Date()));
+}
+
+function getCycleWeekKey(weekNumber = activeCycleWeek) {
+  return Number(weekNumber) === 2 ? "week2" : "week1";
+}
+
+function hasTwoWeekCycleTemplate() {
+  return ["week1", "week2"].some((weekKey) =>
+    Object.keys(state.twoWeekCycle?.patientSchedules?.[weekKey] || {}).length ||
+    Object.keys(state.twoWeekCycle?.staffSchedules?.[weekKey] || {}).length
+  );
+}
+
+function getCycleWeekNumberForDate(dateValue = getCurrentDate()) {
+  if (!hasTwoWeekCycleTemplate()) {
+    return activeCycleWeek;
+  }
+  const anchorWeekStart = normalizeCycleAnchorWeekStart(state.twoWeekCycle?.anchorWeekStart);
+  const anchor = parseDateInput(anchorWeekStart);
+  const currentWeekStart = getWeekStart(parseDateInput(dateValue || formatDateInput(new Date())));
+  const weekDiff = Math.round((currentWeekStart - anchor) / (7 * 24 * 60 * 60 * 1000));
+  return ((weekDiff % 2) + 2) % 2 === 0 ? 1 : 2;
+}
+
+function getDisplayWeekOffsetForDate(dateValue = getCurrentDate()) {
+  const todayWeekStart = getWeekStart(new Date());
+  const targetWeekStart = getWeekStart(parseDateInput(dateValue || formatDateInput(new Date())));
+  return Math.round((targetWeekStart - todayWeekStart) / (7 * 24 * 60 * 60 * 1000));
+}
+
+function getDisplayWeekLabel(offset = getDisplayWeekOffsetForDate()) {
+  const value = Number(offset) || 0;
+  if (!isChineseLanguage()) {
+    if (value === 0) return "This week";
+    if (value === 1) return "Next week";
+    return value > 1 ? `${value} weeks later` : `${Math.abs(value)} weeks ago`;
+  }
+  if (value === 0) return "本周";
+  if (value === 1) return "下周";
+  return value > 1 ? `${value}周后` : `${Math.abs(value)}周前`;
+}
+
+function updateCycleWeekChrome() {
+  if (!ui.cycleWeekTabs) return;
+  const displayOffset = getDisplayWeekOffsetForDate(getCurrentDate());
+  ui.cycleWeekTabs.querySelectorAll("[data-week-offset]").forEach((button) => {
+    button.classList.toggle("active", Number(button.dataset.weekOffset) === displayOffset);
+  });
+  ui.prevWeek.textContent = "本周";
+  ui.nextWeek.textContent = "下周";
+  ui.todayButton.textContent = "回到本周";
+}
+
+function syncActiveCycleWeekFromDate() {
+  const nextWeek = getCycleWeekNumberForDate(getCurrentDate());
+  if (nextWeek === activeCycleWeek) {
+    updateCycleWeekChrome();
+    return;
+  }
+  if (state.twoWeekCycle) {
+    copyWeeklyViewBackToCycle();
+  }
+  activeCycleWeek = nextWeek;
+  syncCycleWeekToWeeklyView();
+  updateCycleWeekChrome();
+}
+
+function setDisplayWeekOffset(offset, resetToToday = false) {
+  if (state.twoWeekCycle) {
+    copyWeeklyViewBackToCycle();
+  }
+
+  const targetOffset = Number(offset) === 1 ? 1 : 0;
+  const today = new Date();
+  const selectedDate = resetToToday ? today : parseDateInput(getCurrentDate());
+  const selectedWeekStart = getWeekStart(selectedDate);
+  const selectedDayOffset = Math.round((selectedDate - selectedWeekStart) / (24 * 60 * 60 * 1000));
+  const targetWeekStart = addDays(getWeekStart(today), targetOffset * 7);
+  ui.scheduleDate.value = formatDateInput(addDays(targetWeekStart, selectedDayOffset));
+
+  refreshScheduleView();
+}
+
+function setActiveCycleWeek(weekNumber) {
+  const nextWeek = Number(weekNumber) === 2 ? 2 : 1;
+  const currentTemplateWeek = getCycleWeekNumberForDate(getCurrentDate());
+  let offset = getDisplayWeekOffsetForDate(getCurrentDate());
+  if (currentTemplateWeek !== nextWeek) {
+    offset += 1;
+  }
+  setDisplayWeekOffset(offset === 1 ? 1 : 0);
+}
+
+function syncCycleWeekToWeeklyView() {
+  const weekKey = getCycleWeekKey();
+  const patientWeek = state.twoWeekCycle?.patientSchedules?.[weekKey] || {};
+  const staffWeek = state.twoWeekCycle?.staffSchedules?.[weekKey] || {};
+  state.weeklySchedules = structuredClone(patientWeek);
+  state.weeklyStaffSchedules = structuredClone(staffWeek);
+}
+
+function copyWeeklyViewBackToCycle() {
+  const weekKey = getCycleWeekKey();
+  state.twoWeekCycle.patientSchedules[weekKey] = structuredClone(state.weeklySchedules || {});
+  state.twoWeekCycle.staffSchedules[weekKey] = structuredClone(state.weeklyStaffSchedules || {});
+}
+
+function getTwoWeekHdfTarget(patient) {
+  const fourWeekCount = Math.max(0, Number(patient.monthlyHdfCount || 0));
+  return Math.floor(fourWeekCount / 2);
+}
+
+function validateEvenFourWeekHdfCounts() {
+  return getSchedulablePatients()
+    .filter((patient) => patient.treatmentType === "hemodialysis")
+    .filter((patient) => Number(patient.monthlyHdfCount || 0) % 2 !== 0)
+    .map((patient) => `${patient.name} 的4周血滤次数不是偶数`);
+}
+
+function getTwoWeekHdfCountForWeek(patient, weekNumber, patientIndex = 0) {
+  const target = getTwoWeekHdfTarget(patient);
+  if (target <= 0) return 0;
+  if (target === 1) {
+    // 每2周1次时，把不同患者均匀分散到第1周或第2周，避免所有血滤集中在同一周。
+    return (patientIndex % 2) + 1 === weekNumber ? 1 : 0;
+  }
+  return weekNumber === 1 ? Math.ceil(target / 2) : Math.floor(target / 2);
+}
+
+function getEvenlyDistributedSessionIndexes(totalSessions, selectedCount, rotation = 0) {
+  const total = Math.max(0, Number(totalSessions) || 0);
+  const count = Math.min(total, Math.max(0, Number(selectedCount) || 0));
+  if (!count) return new Set();
+  const start = ((Number(rotation) || 0) % total + total) % total;
+  if (count === 1) return new Set([start]);
+  const indexes = new Set();
+  for (let index = 0; index < count; index += 1) {
+    indexes.add((start + Math.round((index * total) / count)) % total);
+  }
+  return indexes;
+}
+
+function buildTwoWeekPatientSchedules() {
+  const priority = normalizeSchedulePriority(state.settings.schedulePriority);
+  const warnings = [];
+  const defaultDayNotices = ensureDefaultDialysisDaysForSchedulablePatients(priority);
+  if (defaultDayNotices.length) {
+    warnings.push(...defaultDayNotices.map((item) => `默认透析日：${item}`));
+  }
+  const blocking = validateEvenFourWeekHdfCounts();
+  if (blocking.length) {
+    return { week1: {}, week2: {}, warnings, blocking, fixedMachineAssignments: {} };
+  }
+
+  const buildWeek = (weekNumber, preferredMachineAssignments = {}) =>
+    buildAutoWeeklyPatientSchedules(getCurrentDate(), priority, {
+      skipMonthlyHdfOverrides: true,
+      fastMachineSelection: true,
+      preassignMachines: true,
+      preferredMachineAssignments,
+      sessionTreatmentResolver: ({ patient, patientIndex, index, plannedDays, defaultTreatmentType }) => {
+        if (defaultTreatmentType !== DEFAULT_MACHINE_TYPE) return defaultTreatmentType;
+        const hdfCount = getTwoWeekHdfCountForWeek(patient, weekNumber, patientIndex);
+        const hdfIndexes = getEvenlyDistributedSessionIndexes(plannedDays.length, hdfCount, patientIndex + weekNumber);
+        return hdfIndexes.has(index) ? "hemofiltration" : defaultTreatmentType;
+      },
+    });
+
+  const week1Result = buildWeek(1);
+  warnings.push(...(week1Result.warnings || []).map((item) => `第1周：${item}`));
+  blocking.push(...(week1Result.blocking || []).map((item) => `第1周：${item}`));
+  if (blocking.length) {
+    return {
+      week1: week1Result.schedules || {},
+      week2: {},
+      warnings,
+      blocking,
+      fixedMachineAssignments: week1Result.fixedMachineAssignments || {},
+    };
+  }
+
+  const week2Result = buildWeek(2, getPreferredMachineAssignmentsFromWeek(week1Result.schedules || {}));
+  warnings.push(...(week2Result.warnings || []).map((item) => `第2周：${item}`));
+  blocking.push(...(week2Result.blocking || []).map((item) => `第2周：${item}`));
+
+  return {
+    week1: week1Result.schedules || {},
+    week2: week2Result.schedules || {},
+    warnings,
+    blocking,
+    fixedMachineAssignments: getConsistentTwoWeekFixedMachineAssignments(
+      week1Result.schedules || {},
+      week2Result.schedules || {},
+    ),
+  };
+}
+
+function getPreferredMachineAssignmentsFromWeek(weekSchedules = {}) {
+  const machineCountsByAssignment = new Map();
+  Object.values(weekSchedules || {}).forEach((daySchedule) => {
+    Object.entries(daySchedule || {}).forEach(([machineId, machine]) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        const slot = machine?.[shift];
+        if (!slot?.patientId || slot.removed) return;
+        const assignmentKey = getPatientMachineAssignmentKey(slot.patientId, slot.treatmentType);
+        if (!machineCountsByAssignment.has(assignmentKey)) {
+          machineCountsByAssignment.set(assignmentKey, new Map());
+        }
+        const counts = machineCountsByAssignment.get(assignmentKey);
+        const normalizedMachineId = String(machineId);
+        counts.set(normalizedMachineId, (counts.get(normalizedMachineId) || 0) + 1);
+      });
+    });
+  });
+
+  return [...machineCountsByAssignment.entries()].reduce((result, [assignmentKey, machineCounts]) => {
+    const best = [...machineCounts.entries()].sort((left, right) =>
+      right[1] - left[1] ||
+      sortMachineIds(left[0], right[0]),
+    )[0];
+    if (best?.[0]) {
+      result[assignmentKey] = best[0];
+    }
+    return result;
+  }, {});
+}
+
+function getConsistentTwoWeekFixedMachineAssignments(week1 = {}, week2 = {}) {
+  const assignments = {};
+  getSchedulablePatients().forEach((patient) => {
+    if (patient.fixedMachineId) {
+      return;
+    }
+    const baseTreatmentType = normalizeMachineType(patient.treatmentType);
+    const machineIds = new Set();
+    [week1, week2].forEach((week) => {
+      WORKING_DAY_KEYS.forEach((dayKey) => {
+        Object.entries(week?.[dayKey] || {}).forEach(([machineId, machine]) => {
+          STAFF_SHIFT_KEYS.forEach((shift) => {
+            const slot = machine?.[shift];
+            if (slot?.patientId === patient.id && normalizeMachineType(slot.treatmentType) === baseTreatmentType) {
+              machineIds.add(String(machineId));
+            }
+          });
+        });
+      });
+    });
+    if (machineIds.size === 1) {
+      assignments[patient.id] = [...machineIds][0];
+    }
+  });
+  return assignments;
+}
+
+function findPatientAssignmentInWeek(week, patientId, preferredDayKey = "") {
+  const days = preferredDayKey
+    ? [preferredDayKey, ...WORKING_DAY_KEYS.filter((dayKey) => dayKey !== preferredDayKey)]
+    : [...WORKING_DAY_KEYS];
+  for (const dayKey of days) {
+    const day = week?.[dayKey] || {};
+    for (const [machineId, machine] of Object.entries(day)) {
+      for (const shift of STAFF_SHIFT_KEYS) {
+        if (machine?.[shift]?.patientId === patientId) {
+          return { dayKey, machineId, shift };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function removePatientFromWeekDay(week, dayKey, patientId) {
+  Object.values(week?.[dayKey] || {}).forEach((machine) => {
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      if (machine?.[shift]?.patientId === patientId) {
+        delete machine[shift];
+      }
+    });
+  });
+}
+
+function findCompatibleHdfMachineForAssignment(week, dayKey, shift, patient, preferredMachineId) {
+  const candidates = getMachineIds()
+    .filter((machineId) => getMachineType(machineId) === "hemofiltration")
+    .filter((machineId) => !isMachinePaused(machineId))
+    .filter((machineId) => patientFitsMachineForTreatment(patient, "hemofiltration", machineId))
+    .sort((a, b) => {
+      const aPreferred = String(a) === String(preferredMachineId) ? -1 : 0;
+      const bPreferred = String(b) === String(preferredMachineId) ? -1 : 0;
+      return aPreferred - bPreferred || Number(a) - Number(b);
+    });
+
+  return candidates.find((machineId) => !week?.[dayKey]?.[machineId]?.[shift]) || "";
+}
+
+function buildTwoWeekStaffSchedules(patientResult) {
+  const weekResults = {};
+  const warnings = [];
+  const blocking = [];
+  const doctors = state.staffMembers.filter((staff) => staff.role === "doctor" && staff.status === "active");
+  const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
+  const balancingContext = {
+    assignmentCounts: new Map([...doctors, ...nurses].map((staff) => [staff.id, 0])),
+    nurseWorkedDays: new Map(nurses.map((staff) => [staff.id, new Set()])),
+  };
+
+  for (const [weekKey, weekSchedules] of Object.entries({
+    week1: patientResult.week1,
+    week2: patientResult.week2,
+  })) {
+    const result = buildAutoWeeklyStaffSchedules(
+      structuredClone(weekSchedules),
+      normalizeSchedulePriority(state.settings.schedulePriority),
+      {
+        ...balancingContext,
+        periodPrefix: `${weekKey}:`,
+      },
+    );
+    weekResults[weekKey] = result.schedules;
+    warnings.push(...(result.warnings || []).map((item) => `${weekKey === "week1" ? "第1周" : "第2周"}：${item}`));
+    blocking.push(...(result.blocking || []).map((item) => `${weekKey === "week1" ? "第1周" : "第2周"}：${item}`));
+  }
+
+  return {
+    week1: weekResults.week1 || {},
+    week2: weekResults.week2 || {},
+    warnings,
+    blocking,
+  };
+}
+
+function buildTwoWeekReview(patientResult, staffResult) {
+  const patientRows = getSchedulablePatients()
+    .map((patient) => {
+      const sessions = [];
+      for (const [weekNumber, week] of [[1, patientResult.week1], [2, patientResult.week2]]) {
+        for (const dayKey of WORKING_DAY_KEYS) {
+          const day = week?.[dayKey] || {};
+          for (const [machineId, machine] of Object.entries(day)) {
+            for (const shift of STAFF_SHIFT_KEYS) {
+              const entry = machine?.[shift];
+              if (entry?.patientId === patient.id) {
+                sessions.push({
+                  weekNumber,
+                  dayKey,
+                  shift,
+                  machineId,
+                  treatmentType: entry.treatmentType || patient.treatmentType,
+                });
+              }
+            }
+          }
+        }
+      }
+      const hdfCount = sessions.filter((session) => session.treatmentType === "hemofiltration").length;
+      return {
+        patientId: patient.id,
+        name: patient.name,
+        targetTreatmentCount: clampNumber(patient.weeklyTreatmentCount, 1, 6, 3) * 2,
+        targetHdfCount: getTwoWeekHdfTarget(patient),
+        actualHdfCount: hdfCount,
+        sessions,
+      };
+    });
+
+  const staffRows = state.staffMembers
+    .filter((staff) => staff.status === "active")
+    .map((staff) => {
+      const duties = [];
+      for (const [weekNumber, staffWeek, patientWeek] of [
+        [1, staffResult.week1, patientResult.week1],
+        [2, staffResult.week2, patientResult.week2],
+      ]) {
+        for (const dayKey of WORKING_DAY_KEYS) {
+          for (const shift of STAFF_SHIFT_KEYS) {
+            const entry = staffWeek?.[dayKey]?.[shift] || {};
+            if ((entry.doctors || []).includes(staff.id)) {
+              duties.push({ weekNumber, dayKey, shift, role: "医生" });
+            }
+            const nurseIndex = (entry.nurses || []).indexOf(staff.id);
+            if (nurseIndex >= 0) {
+              const groups = getNurseGroupsForShift(patientWeek?.[dayKey] || {}, shift, state.settings)
+                .filter((group) => group && !group.empty);
+              const group = groups[nurseIndex];
+              const zoneLabel = getNurseGroupReviewLabel(group);
+              duties.push({
+                weekNumber,
+                dayKey,
+                shift,
+                role: zoneLabel ? `负责：${zoneLabel}` : `责任护士${nurseIndex + 1}`,
+              });
+            }
+            if (entry.backupNurse === staff.id) {
+              duties.push({ weekNumber, dayKey, shift, role: "后备护士" });
+            }
+          }
+        }
+      }
+      const workedDays = new Set(duties.map((duty) => `${duty.weekNumber}-${duty.dayKey}`)).size;
+      const fullDays = [...new Set(duties.map((duty) => `${duty.weekNumber}-${duty.dayKey}`))]
+        .filter((dayId) => {
+          const [weekNumber, dayKey] = dayId.split("-");
+          const dayDuties = duties.filter(
+            (duty) => String(duty.weekNumber) === weekNumber && duty.dayKey === dayKey,
+          );
+          return dayDuties.some((duty) => duty.shift === "morning") &&
+            dayDuties.some((duty) => duty.shift === "afternoon");
+        }).length;
+      return {
+        staffId: staff.id,
+        name: staff.name,
+        role: staff.role,
+        duties,
+        shiftCount: duties.length,
+        workedDays,
+        fullDays,
+        restDays: 12 - workedDays,
+      };
+    });
+
+  const cycleBoundaryWarnings = validateTwoWeekCycleBoundary(patientResult);
+  return {
+    generatedAt: new Date().toISOString(),
+    patientRows,
+    staffRows,
+    warnings: [...patientResult.warnings, ...staffResult.warnings, ...cycleBoundaryWarnings],
+    blocking: [...patientResult.blocking, ...staffResult.blocking],
+    stats: {
+      patientCount: patientRows.length,
+      expectedTreatmentCount: patientRows.reduce((sum, row) => sum + row.targetTreatmentCount, 0),
+      treatmentCount: patientRows.reduce((sum, row) => sum + row.sessions.length, 0),
+      hdfTargetCount: patientRows.reduce((sum, row) => sum + row.targetHdfCount, 0),
+      hdfActualCount: patientRows.reduce((sum, row) => sum + row.actualHdfCount, 0),
+      staffCount: staffRows.length,
+    },
+  };
+}
+
+function validateTwoWeekCycleBoundary(patientResult) {
+  const warnings = [];
+  getSchedulablePatients().forEach((patient) => {
+    const week2Days = getPatientTreatmentDayIndexes(patientResult.week2, patient.id, 7);
+    const week1Days = getPatientTreatmentDayIndexes(patientResult.week1, patient.id, 14);
+    if (!week2Days.length || !week1Days.length) return;
+    const last = Math.max(...week2Days);
+    const firstNextCycle = Math.min(...week1Days);
+    if (firstNextCycle - last < 2) {
+      warnings.push(`${patient.name} 在第2周末与下一轮第1周初之间没有完整间隔一天。`);
+    }
+  });
+  return warnings;
+}
+
+function getPatientTreatmentDayIndexes(week, patientId, offset) {
+  const indexes = [];
+  WORKING_DAY_KEYS.forEach((dayKey, dayIndex) => {
+    const day = week?.[dayKey] || {};
+    const assigned = Object.values(day).some((machine) =>
+      STAFF_SHIFT_KEYS.some((shift) => machine?.[shift]?.patientId === patientId),
+    );
+    if (assigned) indexes.push(offset + dayIndex);
+  });
+  return indexes;
+}
+
+function rebuildBaseWeeklyTemplateForTwoWeek() {
+  const priority = normalizeSchedulePriority(state.settings.schedulePriority);
+  const patientResult = buildAutoWeeklyPatientSchedules(getCurrentDate(), priority);
+  const staffResult = buildAutoWeeklyStaffSchedules(patientResult.schedules, priority);
+  const safetyErrors = validateGeneratedWeeklySafety(
+    patientResult.schedules,
+    staffResult.schedules,
+  );
+  const blocking = [
+    ...(patientResult.blocking || []),
+    ...(staffResult.blocking || []),
+    ...safetyErrors,
+  ];
+
+  if (blocking.length) {
+    return {
+      ok: false,
+      blocking,
+      warnings: [
+        ...(patientResult.warnings || []),
+        ...(staffResult.warnings || []),
+      ],
+    };
+  }
+
+  // 无论之前是否已有排班，每次都覆盖内存中的基础周模板，
+  // 保证本次报告来自一次全新的自动排列。
+  state.weeklySchedules = {};
+  state.weeklyStaffSchedules = {};
+
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    if (Object.keys(patientResult.schedules?.[dayKey] || {}).length) {
+      state.weeklySchedules[dayKey] = structuredClone(
+        patientResult.schedules[dayKey],
+      );
+    }
+    state.weeklyStaffSchedules[dayKey] = structuredClone(
+      staffResult.schedules?.[dayKey] || {},
+    );
+  });
+
+  const fixedAt = new Date().toISOString();
+  Object.entries(patientResult.fixedMachineAssignments || {}).forEach(
+    ([patientId, machineId]) => {
+      const patient = findPatient(patientId);
+      if (patient && !patient.fixedMachineId && machineId) {
+        patient.fixedMachineId = machineId;
+        patient.fixedMachineLockedAt = fixedAt;
+        patient.updatedAt = fixedAt;
+      }
+    },
+  );
+
+  return {
+    ok: true,
+    warnings: [
+      "本次报告已忽略原有排班并执行一次全新的自动排列。",
+      ...(patientResult.warnings || []),
+      ...(staffResult.warnings || []),
+    ],
+  };
+}
+
+function waitForBrowserPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      setTimeout(resolve, 30);
+    });
+  });
+}
+
+function showTwoWeekLoadingDialog(message = "正在重新排列2周排班，请稍候……") {
+  ui.confirmTwoWeekPlan.hidden = true;
+  ui.twoWeekReviewTitle.textContent = "正在生成全新的2周排班";
+  ui.twoWeekReviewMeta.textContent = "系统正在重新排列患者、血滤、机位和医护班次";
+  ui.twoWeekReviewContent.innerHTML = `
+    <section class="two-week-loading-panel">
+      <div class="two-week-loading-spinner" aria-hidden="true"></div>
+      <h3 id="twoWeekProgressTitle">${escapeHtml(message)}</h3>
+      <div class="two-week-progress-shell" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+           id="twoWeekProgressBar">
+        <div class="two-week-progress-fill" id="twoWeekProgressFill"></div>
+      </div>
+      <div class="two-week-progress-row">
+        <span id="twoWeekProgressStage">准备排班数据</span>
+        <strong id="twoWeekProgressPercent">0%</strong>
+      </div>
+      <p>数据量较大时可能需要数秒，请不要重复点击。</p>
+    </section>
+  `;
+  if (!ui.twoWeekReviewDialog.open) {
+    ui.twoWeekReviewDialog.showModal();
+  }
+}
+
+function updateTwoWeekProgress(percent, stage, title = "") {
+  const safePercent = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const bar = document.getElementById("twoWeekProgressBar");
+  const fill = document.getElementById("twoWeekProgressFill");
+  const stageNode = document.getElementById("twoWeekProgressStage");
+  const percentNode = document.getElementById("twoWeekProgressPercent");
+  const titleNode = document.getElementById("twoWeekProgressTitle");
+
+  if (bar) bar.setAttribute("aria-valuenow", String(safePercent));
+  if (fill) fill.style.width = `${safePercent}%`;
+  if (stageNode) stageNode.textContent = stage || "";
+  if (percentNode) percentNode.textContent = `${safePercent}%`;
+  if (title && titleNode) titleNode.textContent = title;
+}
+
+function formatTwoWeekBlockingErrors(items, limit = 24) {
+  const unique = [...new Set((items || []).filter(Boolean).map(String))];
+  const visible = unique.slice(0, limit);
+  const remaining = unique.length - visible.length;
+  return `${visible.map((item) => `- ${item}`).join("\n")}${remaining > 0 ? `\n- 其余 ${remaining} 项请在资料中继续检查。` : ""}`;
+}
+
+function showTwoWeekGenerationError(error, prefix = "生成2周报告失败") {
+  console.error(prefix, error);
+  ui.confirmTwoWeekPlan.hidden = true;
+  ui.twoWeekReviewTitle.textContent = prefix;
+  ui.twoWeekReviewMeta.textContent = "程序捕获到了运行错误，没有继续保存排班。";
+  ui.twoWeekReviewContent.innerHTML = `
+    <section class="two-week-error-panel">
+      <h3>无法完成本次重新排列</h3>
+      <p>${escapeHtml(error?.message || String(error || "未知错误"))}</p>
+      <p>请关闭窗口后检查患者、机器和医护资料，再重新尝试。</p>
+    </section>
+  `;
+  if (!ui.twoWeekReviewDialog.open) {
+    ui.twoWeekReviewDialog.showModal();
+  }
+}
+
+async function buildFreshTwoWeekPlan() {
+  updateTwoWeekProgress(5, "读取患者、机器和医护资料");
+  await waitForBrowserPaint();
+
+  updateTwoWeekProgress(18, "生成第1周和第2周患者排班");
+  await waitForBrowserPaint();
+  const patientResult = buildTwoWeekPatientSchedules();
+  if (patientResult.blocking?.length) {
+    return { ok: false, blocking: patientResult.blocking };
+  }
+
+  updateTwoWeekProgress(55, "分配血滤、机位和治疗班次");
+  await waitForBrowserPaint();
+
+  updateTwoWeekProgress(72, "安排医生、责任护士和后备护士");
+  await waitForBrowserPaint();
+  const staffResult = buildTwoWeekStaffSchedules(patientResult);
+  if (staffResult.blocking?.length) {
+    return { ok: false, blocking: staffResult.blocking };
+  }
+
+  updateTwoWeekProgress(88, "执行循环边界与安全检查");
+  await waitForBrowserPaint();
+  const safetyErrors = [
+    ...validateGeneratedWeeklySafety(patientResult.week1, staffResult.week1).map((item) => `第1周：${item}`),
+    ...validateGeneratedWeeklySafety(patientResult.week2, staffResult.week2).map((item) => `第2周：${item}`),
+  ];
+  if (safetyErrors.length) {
+    return { ok: false, blocking: safetyErrors };
+  }
+
+  const review = buildTwoWeekReview(patientResult, staffResult);
+
+  updateTwoWeekProgress(96, "整理2周人工复核报告");
+  await waitForBrowserPaint();
+
+  const result = {
+    ok: true,
+    plan: {
+      patientSchedules: {
+        week1: patientResult.week1,
+        week2: patientResult.week2,
+      },
+      staffSchedules: {
+        week1: staffResult.week1,
+        week2: staffResult.week2,
+      },
+      fixedMachineAssignments: patientResult.fixedMachineAssignments || {},
+      review,
+    },
+  };
+
+  updateTwoWeekProgress(100, "排班与报告生成完成");
+  await waitForBrowserPaint();
+  return result;
+}
+
+async function generateTwoWeekPlan() {
+  if (ui.generateTwoWeekPlan.disabled) {
+    return;
+  }
+
+  ui.generateTwoWeekPlan.disabled = true;
+  showTwoWeekLoadingDialog("正在生成全新的第1周和第2周排班……");
+  await waitForBrowserPaint();
+
+  try {
+    const freshResult = await buildFreshTwoWeekPlan();
+    if (!freshResult.ok) {
+      const details = formatTwoWeekBlockingErrors(freshResult.blocking || []);
+      throw new Error(details || "存在无法继续排班的安全冲突。");
+    }
+
+    pendingTwoWeekPlan = freshResult.plan;
+
+    ui.twoWeekReviewDialog.close();
+    const approved = await showTwoWeekReview(pendingTwoWeekPlan, true);
+    if (!approved) {
+      return;
+    }
+
+    if (pendingTwoWeekPlan.review.blocking.length) {
+      window.alert("存在阻止保存的问题，请先解决后再保存2周循环模板。");
+      return;
+    }
+
+    saveTwoWeekCycleTemplate();
+  } catch (error) {
+    showTwoWeekGenerationError(error, "生成2周排班失败");
+  } finally {
+    ui.generateTwoWeekPlan.disabled = false;
+  }
+}
+
+function saveTwoWeekCycleTemplate() {
+  if (pendingTwoWeekPlan) {
+    state.twoWeekCycle = {
+      patientSchedules: structuredClone(pendingTwoWeekPlan.patientSchedules),
+      staffSchedules: structuredClone(pendingTwoWeekPlan.staffSchedules),
+      review: structuredClone(pendingTwoWeekPlan.review),
+      savedAt: new Date().toISOString(),
+      anchorWeekStart: formatDateInput(getWeekStart(parseDateInput(getCurrentDate()))),
+    };
+    const fixedAt = new Date().toISOString();
+    Object.entries(pendingTwoWeekPlan.fixedMachineAssignments || {}).forEach(([patientId, machineId]) => {
+      const patient = findPatient(patientId);
+      if (patient && !patient.fixedMachineId && machineId) {
+        patient.fixedMachineId = String(machineId);
+        patient.fixedMachineLockedAt = fixedAt;
+        patient.updatedAt = fixedAt;
+      }
+    });
+  } else {
+    copyWeeklyViewBackToCycle();
+    const hasAnyPlan = ["week1", "week2"].some((weekKey) =>
+      Object.keys(state.twoWeekCycle?.patientSchedules?.[weekKey] || {}).length,
+    );
+    if (!hasAnyPlan) {
+      window.alert("当前没有可保存的2周排班，请先生成2周排班。");
+      return;
+    }
+    const currentReview = buildCurrentTwoWeekReview();
+    if (currentReview) {
+      state.twoWeekCycle.review = structuredClone(currentReview);
+    }
+    state.twoWeekCycle.anchorWeekStart = state.twoWeekCycle.anchorWeekStart || getAnchorWeekStartForActiveCycle();
+    state.twoWeekCycle.savedAt = new Date().toISOString();
+  }
+  saveState();
+  pendingTwoWeekPlan = null;
+  syncCycleWeekToWeeklyView();
+  refreshScheduleView();
+  showToast("长期2周循环模板已保存：第1周 → 第2周 → 第1周持续循环");
+}
+
+function getAnchorWeekStartForActiveCycle(dateValue = getCurrentDate()) {
+  const selectedWeekStart = getWeekStart(parseDateInput(dateValue || formatDateInput(new Date())));
+  return formatDateInput(activeCycleWeek === 2 ? addDays(selectedWeekStart, -7) : selectedWeekStart);
+}
+
+function buildCurrentTwoWeekReview() {
+  // 先把当前正在编辑的周写回2周循环数据，确保报告反映最新修改。
+  copyWeeklyViewBackToCycle();
+
+  const patientResult = {
+    week1: structuredClone(state.twoWeekCycle?.patientSchedules?.week1 || {}),
+    week2: structuredClone(state.twoWeekCycle?.patientSchedules?.week2 || {}),
+    warnings: [],
+    blocking: [],
+  };
+  const staffResult = {
+    week1: structuredClone(state.twoWeekCycle?.staffSchedules?.week1 || {}),
+    week2: structuredClone(state.twoWeekCycle?.staffSchedules?.week2 || {}),
+    warnings: [],
+    blocking: [],
+  };
+
+  const hasPatientSchedule =
+    Object.keys(patientResult.week1).length > 0 ||
+    Object.keys(patientResult.week2).length > 0;
+
+  if (!hasPatientSchedule) {
+    return null;
+  }
+
+  return buildTwoWeekReview(patientResult, staffResult);
+}
+
+function openStoredTwoWeekReview() {
+  if (ui.openTwoWeekReview.disabled) {
+    return;
+  }
+
+  ui.openTwoWeekReview.disabled = true;
+  try {
+    const review = buildCurrentTwoWeekReview();
+    if (!review) {
+      window.alert("当前没有可生成报告的2周排班，请先生成或手动保存2周排班。");
+      return;
+    }
+    showTwoWeekReview({ review }, false, "当前排班报告");
+  } catch (error) {
+    showTwoWeekGenerationError(error, "生成当前2周排班报告失败");
+  } finally {
+    ui.openTwoWeekReview.disabled = false;
+  }
+}
+
+function showTwoWeekReview(plan, confirmMode = false, sourceLabel = "全新自动重排") {
+  const review = plan?.review;
+  if (!review) {
+    window.alert("2周总结数据为空，请重新生成2周排班。");
+    return Promise.resolve(false);
+  }
+  ui.twoWeekReviewTitle.textContent = confirmMode
+    ? "请复核：新生成2周排班"
+    : "请复核：当前2周排班报告";
+  const runAssessment = getTwoWeekRunAssessmentForReview(review);
+  ui.twoWeekReviewMeta.innerHTML = renderTwoWeekReviewHeaderMeta(review, sourceLabel, confirmMode);
+  ui.twoWeekReviewContent.innerHTML = renderTwoWeekReview(review, confirmMode, runAssessment);
+  configureTwoWeekApplyControls(runAssessment, confirmMode);
+  ui.twoWeekReviewDialog.showModal();
+  if (!confirmMode) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    pendingTwoWeekResolver = resolve;
+  });
+}
+
+function getTwoWeekRunAssessmentForReview(review) {
+  const scheduledPatients = review.patientRows.filter((row) => row.sessions.length > 0).length;
+  const hdfMatched = review.stats.hdfTargetCount === review.stats.hdfActualCount;
+  return buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched);
+}
+
+function configureTwoWeekApplyControls(runAssessment, confirmMode = false) {
+  ui.confirmTwoWeekPlan.hidden = !confirmMode;
+  ui.confirmTwoWeekPlan.disabled = Boolean(confirmMode && !runAssessment.canApply);
+  ui.confirmTwoWeekPlan.textContent = runAssessment.canApply
+    ? "应用为长期2周循环"
+    : "暂不能应用：先处理阻止项";
+}
+
+function renderTwoWeekReviewHeaderMeta(review, sourceLabel, confirmMode = false) {
+  const blockingCount = review?.blocking?.length || 0;
+  const warningCount = review?.warnings?.length || 0;
+  const issueClass = blockingCount ? "danger" : warningCount ? "warning" : "ok";
+  const issueText = blockingCount
+    ? `${blockingCount}项阻止保存`
+    : warningCount
+      ? `${warningCount}项需留意`
+      : "无阻止项";
+  const actionText = confirmMode ? "复核通过后保存模板" : "仅生成报告，不重新排班";
+  const chips = [
+    { text: sourceLabel, className: "source" },
+    { text: "2周循环模板" },
+    { text: `策略：${getSchedulePriorityLabel(state.settings.schedulePriority)}` },
+    { text: `护士：${getStaffWorkModeLabel()}` },
+    { text: issueText, className: issueClass },
+    { text: actionText, className: "action" },
+  ];
+  return [
+    '<span class="two-week-review-meta-label">审核重点</span>',
+    ...chips.map(({ text, className = "" }) =>
+      `<span class="two-week-review-chip ${escapeHtml(className)}">${escapeHtml(text)}</span>`
+    ),
+  ].join("");
+}
+
+function closeTwoWeekReview(approved = false) {
+  if (ui.twoWeekReviewDialog.open) ui.twoWeekReviewDialog.close();
+  const resolver = pendingTwoWeekResolver;
+  pendingTwoWeekResolver = null;
+  if (resolver) resolver(Boolean(approved));
+}
+
+function renderTwoWeekReview(review, confirmMode = false, runAssessment = null) {
+  const scheduledPatients = review.patientRows.filter((row) => row.sessions.length > 0).length;
+  const unscheduledPatients = review.stats.patientCount - scheduledPatients;
+  const hdfMatched = review.stats.hdfTargetCount === review.stats.hdfActualCount;
+  const assessment = runAssessment || buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched);
+  const summaryText = [
+    `本次2周循环共纳入 ${review.stats.patientCount} 名患者，实际排入 ${scheduledPatients} 名`,
+    `治疗 ${review.stats.treatmentCount}/${review.stats.expectedTreatmentCount || review.stats.treatmentCount} 人次`,
+    `血滤 ${review.stats.hdfActualCount}/${review.stats.hdfTargetCount} 次`,
+    `医护 ${review.stats.staffCount} 人参与排班`,
+  ].join("；") + "。";
+  const statusCards = [
+    { label: "纳入患者", value: review.stats.patientCount, detail: `已排 ${scheduledPatients} 人`, tone: unscheduledPatients ? "danger" : "ok" },
+    { label: "治疗人次", value: `${review.stats.treatmentCount}/${review.stats.expectedTreatmentCount || review.stats.treatmentCount}`, detail: "实际/应排" },
+    { label: "血滤完成", value: `${review.stats.hdfActualCount}/${review.stats.hdfTargetCount}`, detail: hdfMatched ? "目标一致" : "需核对", tone: hdfMatched ? "ok" : "warning" },
+    { label: "医护人数", value: review.stats.staffCount, detail: "医生+护士" },
+    { label: "阻止项", value: review.blocking.length, detail: review.blocking.length ? "不能直接保存" : "可继续复核", tone: review.blocking.length ? "danger" : "ok" },
+    { label: "提醒项", value: review.warnings.length, detail: review.warnings.length ? "请人工确认" : "暂无提醒", tone: review.warnings.length ? "warning" : "ok" },
+  ];
+  const issueItems = [
+    ...review.blocking.map((item) => ({ ...simplifyTwoWeekReviewIssue(item, review), tone: "danger", label: "阻止" })),
+    ...review.warnings.map((item) => ({ ...simplifyTwoWeekReviewIssue(item, review), tone: "warning", label: "提醒" })),
+  ];
+  const issueHtml = issueItems.length
+    ? issueItems.map((item) => `
+      <div class="two-week-issue ${item.tone}">
+        <strong>${escapeHtml(item.label)}</strong>
+        <span>${item.html ? item.text : escapeHtml(item.text)}</span>
+      </div>
+    `).join("")
+    : '<div class="two-week-issue ok"><strong>通过</strong><span>未发现2周循环边界阻止项，仍需人工复核患者和医护明细。</span></div>';
+  const patientCards = renderTwoWeekPatientCards(review.patientRows);
+  const staffCards = renderTwoWeekStaffCards(review.staffRows);
+
+  return `
+    <section class="two-week-report-hero">
+      <div>
+        <h3>本次排班报告</h3>
+        <p>${escapeHtml(summaryText)}</p>
+      </div>
+      <div class="two-week-review-stats">
+        ${statusCards.map((card) => `
+          <article class="${escapeHtml(card.tone || "")}">
+            <span>${escapeHtml(card.label)}</span>
+            <strong>${escapeHtml(String(card.value))}</strong>
+            <em>${escapeHtml(card.detail)}</em>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+    <section class="two-week-run-assessment ${escapeHtml(assessment.tone)}">
+      <div>
+        <span class="two-week-run-eyebrow">护士长结论</span>
+        <h3>${escapeHtml(assessment.title)}</h3>
+        <p>${escapeHtml(assessment.summary)}</p>
+        <p class="two-week-strategy-advice">${escapeHtml(assessment.strategyAdvice)}</p>
+        ${renderTwoWeekApplyPanel(assessment, confirmMode)}
+      </div>
+      <div class="two-week-run-checks">
+        ${assessment.checks.map((check) => `
+          <article class="${escapeHtml(check.tone)}">
+            <span>${escapeHtml(check.label)}</span>
+            <strong>${escapeHtml(check.value)}</strong>
+            <em>${escapeHtml(check.detail)}</em>
+            ${check.facts?.length ? `
+              <ul>
+                ${check.facts.map((fact) => `<li>${escapeHtml(fact)}</li>`).join("")}
+              </ul>
+            ` : ""}
+          </article>
+        `).join("")}
+      </div>
+    </section>
+    <section class="two-week-review-section">
+      <h3>需要先看的问题</h3>
+      <div class="two-week-issue-list">${issueHtml}</div>
+    </section>
+    <section class="two-week-review-section">
+      <h3>患者2周治疗明细</h3>
+      ${patientCards}
+    </section>
+    <section class="two-week-review-section">
+      <h3>医护2周工作与休息</h3>
+      ${staffCards}
+    </section>
+  `;
+}
+
+function renderTwoWeekPatientCards(rows = []) {
+  if (!rows.length) {
+    return '<div class="two-week-empty-note">暂无患者排班</div>';
+  }
+  return `
+    <div class="two-week-person-card-grid patient-cards">
+      ${rows.map(renderTwoWeekPatientCard).join("")}
+    </div>
+  `;
+}
+
+function renderTwoWeekPatientCard(row) {
+  const treatmentOk = row.sessions.length >= row.targetTreatmentCount;
+  const hdfOk = row.actualHdfCount >= row.targetHdfCount;
+  return `
+    <article class="two-week-person-card ${treatmentOk && hdfOk ? "ok" : "warning"}">
+      <div class="two-week-person-card-head">
+        <div>
+          <strong>${escapeHtml(row.name)}</strong>
+          <span>${escapeHtml(`${row.sessions.length}/${row.targetTreatmentCount}次治疗 · 血滤${row.actualHdfCount}/${row.targetHdfCount}`)}</span>
+        </div>
+        <div class="two-week-card-badges">
+          <span class="two-week-card-badge ${treatmentOk ? "ok" : "warning"}">${escapeHtml(treatmentOk ? "治疗达标" : "治疗不足")}</span>
+          <span class="two-week-card-badge ${hdfOk ? "ok" : "warning"}">${escapeHtml(hdfOk ? "血滤达标" : "血滤不足")}</span>
+        </div>
+      </div>
+      ${renderTwoWeekCardWeekLine(row.sessions, 1, "patient")}
+      ${renderTwoWeekCardWeekLine(row.sessions, 2, "patient")}
+    </article>
+  `;
+}
+
+function renderTwoWeekStaffCards(rows = []) {
+  if (!rows.length) {
+    return '<div class="two-week-empty-note">暂无医护排班</div>';
+  }
+  return `
+    <div class="two-week-person-card-grid staff-cards">
+      ${rows.map(renderTwoWeekStaffCard).join("")}
+    </div>
+  `;
+}
+
+function renderTwoWeekStaffCard(row) {
+  const roleLabel = row.role === "doctor" ? "医生" : "护士";
+  const loadTone = row.shiftCount === 0 ? "rest" : row.restDays >= 6 ? "ok" : row.restDays <= 2 ? "warning" : "neutral";
+  return `
+    <article class="two-week-person-card staff ${loadTone}">
+      <div class="two-week-person-card-head">
+        <div>
+          <strong>${escapeHtml(row.name)}</strong>
+          <span>${escapeHtml(`${roleLabel} · ${row.shiftCount}个半日班 · 工作${row.workedDays}天 · 休息${row.restDays}天`)}</span>
+        </div>
+        <div class="two-week-card-badges">
+          <span class="two-week-card-badge neutral">${escapeHtml(`${row.fullDays}天整日`)}</span>
+          <span class="two-week-card-badge ${loadTone}">${escapeHtml(row.shiftCount ? `${row.restDays}天休息` : "本轮无班")}</span>
+        </div>
+      </div>
+      ${renderTwoWeekCardWeekLine(row.duties, 1, "staff")}
+      ${renderTwoWeekCardWeekLine(row.duties, 2, "staff")}
+    </article>
+  `;
+}
+
+function renderTwoWeekCardWeekLine(items = [], weekNumber = 1, type = "patient") {
+  return `
+    <div class="two-week-card-week-line">
+      <span class="two-week-card-week-label">第${weekNumber}周</span>
+      ${WORKING_DAY_KEYS.map((dayKey) => renderTwoWeekCardDayCell(items, weekNumber, dayKey, type)).join("")}
+    </div>
+  `;
+}
+
+function renderTwoWeekCardDayCell(items = [], weekNumber, dayKey, type) {
+  const dayItems = items.filter((item) => Number(item.weekNumber) === Number(weekNumber) && String(item.dayKey) === String(dayKey));
+  if (!dayItems.length) {
+    return `
+      <div class="two-week-card-day rest">
+        <b>${escapeHtml(getWeekDayLabel(dayKey))}</b>
+        <span>休</span>
+      </div>
+    `;
+  }
+  const tone = type === "patient"
+    ? dayItems.some((item) => normalizeMachineType(item.treatmentType) === "hemofiltration") ? "hdf" : "patient"
+    : dayItems.some((item) => String(item.role || "").includes("后备")) ? "backup" : "staff";
+  return `
+    <div class="two-week-card-day ${escapeHtml(tone)}">
+      <b>${escapeHtml(getWeekDayLabel(dayKey))}</b>
+      <div class="two-week-card-day-items">
+        ${dayItems.map((item) => type === "patient"
+          ? renderTwoWeekPatientCardItem(item)
+          : renderTwoWeekStaffCardItem(item)
+        ).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderTwoWeekPatientCardItem(session) {
+  const treatmentType = normalizeMachineType(session.treatmentType);
+  const treatmentLabel = getTreatmentLabel(treatmentType);
+  return `
+    <span class="${treatmentType === "hemofiltration" ? "hdf" : ""}">
+      ${escapeHtml(`${SHIFT_LABELS[session.shift] || ""} ${session.machineId}号机 ${treatmentLabel}`)}
+    </span>
+  `;
+}
+
+function renderTwoWeekStaffCardItem(duty) {
+  const shortRole = String(duty.role || "")
+    .replace("负责：", "")
+    .replace(" · ", " ");
+  return `<span>${escapeHtml(`${SHIFT_LABELS[duty.shift] || ""} ${shortRole}`)}</span>`;
+}
+
+function renderTwoWeekApplyPanel(assessment, confirmMode = false) {
+  const disabled = assessment.canApply ? "" : " disabled";
+  const mode = confirmMode ? "pending" : "current";
+  return `
+    <div class="two-week-apply-panel ${escapeHtml(assessment.tone)}">
+      <div>
+        <strong>${escapeHtml(assessment.applyTitle)}</strong>
+        <span>${escapeHtml(assessment.applyDetail)}</span>
+      </div>
+      <button class="${assessment.canApply ? "primary-button" : "ghost-button"}" type="button"
+              data-two-week-apply="${escapeHtml(mode)}"${disabled}>
+        ${escapeHtml(assessment.applyButtonText)}
+      </button>
+    </div>
+  `;
+}
+
+function handleTwoWeekReviewContentClick(event) {
+  const button = event.target.closest("[data-two-week-apply]");
+  if (!button || button.disabled) return;
+  if (button.dataset.twoWeekApply === "pending") {
+    closeTwoWeekReview(true);
+    return;
+  }
+  applyCurrentTwoWeekCycleFromReview();
+}
+
+function applyCurrentTwoWeekCycleFromReview() {
+  const review = buildCurrentTwoWeekReview();
+  if (!review) {
+    window.alert("当前没有可应用的2周排班，请先生成2周排班。");
+    return;
+  }
+  const assessment = getTwoWeekRunAssessmentForReview(review);
+  if (!assessment.canApply) {
+    window.alert("当前2周排班还有硬性问题，暂不能应用为长期循环。请先处理阻止项。");
+    return;
+  }
+  saveTwoWeekCycleTemplate();
+  if (ui.twoWeekReviewDialog.open) {
+    ui.twoWeekReviewDialog.close();
+  }
+}
+
+function buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched) {
+  const expectedTreatmentCount = review.stats.expectedTreatmentCount || review.stats.treatmentCount;
+  const twoWeekWorkingDays = WORKING_DAY_KEYS.length * 2;
+  const twoWeekHalfDaySlots = twoWeekWorkingDays * STAFF_SHIFT_KEYS.length;
+  const expectedTreatmentPerWeek = expectedTreatmentCount / 2;
+  const actualTreatmentPerWeek = review.stats.treatmentCount / 2;
+  const hdfTargetPerWeek = review.stats.hdfTargetCount / 2;
+  const hdfActualPerWeek = review.stats.hdfActualCount / 2;
+  const treatmentComplete = review.stats.treatmentCount >= expectedTreatmentCount;
+  const patientComplete = scheduledPatients === review.stats.patientCount;
+  const shortPatients = (review.patientRows || [])
+    .filter((row) => row.targetTreatmentCount && row.sessions.length < row.targetTreatmentCount)
+    .map((row) => `${row.name}少${row.targetTreatmentCount - row.sessions.length}次`);
+  const staffWithDuties = (review.staffRows || []).filter((row) => row.shiftCount > 0);
+  const minRestDays = staffWithDuties.length
+    ? Math.min(...staffWithDuties.map((row) => row.restDays))
+    : 0;
+  const maxShiftCount = staffWithDuties.length
+    ? Math.max(...staffWithDuties.map((row) => row.shiftCount))
+    : 0;
+  const unusedNurseCount = (review.staffRows || []).filter((row) => row.role === "nurse" && row.shiftCount === 0).length;
+  const totalStaffShiftCount = staffWithDuties.reduce((sum, row) => sum + row.shiftCount, 0);
+  const averageStaffShiftCount = staffWithDuties.length ? totalStaffShiftCount / staffWithDuties.length : 0;
+  const hdfTargetPatientCount = (review.patientRows || []).filter((row) => row.targetHdfCount > 0).length;
+  const hdfShortCount = Math.max(0, review.stats.hdfTargetCount - review.stats.hdfActualCount);
+  const blockingCount = review.blocking?.length || 0;
+  const warningCount = review.warnings?.length || 0;
+  const hasBlocking = Boolean(review.blocking?.length);
+  const hasCoreGap = !patientComplete || !treatmentComplete || !hdfMatched;
+  const hasWarnings = Boolean(review.warnings?.length);
+  const hasStaffLoadWarning = staffWithDuties.length > 0 && minRestDays < 2;
+  const needsNurseManagerReview = hasWarnings || hasStaffLoadWarning;
+  const strategyRestComparison = buildTwoWeekStrategyRestComparison();
+
+  let tone = "ok";
+  let title = "可以作为长期2周循环运行";
+  let summary = "患者治疗、血滤目标、医护覆盖和循环边界都通过。护士长复核明细后，可以按这套2周循环执行。";
+  let applyTitle = "最终建议：可以应用为长期2周循环";
+  let applyDetail = `系统判断这套方案可按“第1周 → 第2周 → 第1周”持续循环；统计周期为2周，周一至周六共${twoWeekWorkingDays}个治疗日。`;
+  let applyButtonText = "应用为长期2周循环";
+
+  if (hasBlocking || hasCoreGap) {
+    tone = "danger";
+    title = "暂不建议持续运行";
+    summary = "这套排班还有硬性问题，先不要作为长期循环执行。请先处理未排满、血滤不达标或阻止项。";
+    applyTitle = "最终建议：暂不能应用";
+    applyDetail = "系统发现硬性问题，应用后可能造成漏排、血滤不足或保存风险。请先处理下方阻止项。";
+    applyButtonText = "暂不能应用";
+  } else if (needsNurseManagerReview) {
+    tone = "warning";
+    title = "可以运行，但护士长需要先复核提醒项";
+    summary = hasStaffLoadWarning && !hasWarnings
+      ? "患者和血滤都已排满，没有阻止保存的问题；但个别医护休息天数偏少，建议护士长确认人员负担后再长期使用。"
+      : "患者和血滤都已排满，没有阻止保存的问题；但有策略回退、星期几倾向调整、医护整日优先或人员负担等提醒，建议护士长确认后再长期使用。";
+    applyTitle = "最终建议：复核提醒后可以应用";
+    applyDetail = `没有阻止长期循环的问题；建议护士长先看完${warningCount}项提醒，再应用为长期2周循环。`;
+    applyButtonText = "复核后应用长期2周循环";
+  }
+
+  const shortPatientDetail = shortPatients.length
+    ? `${shortPatients.slice(0, 4).join("、")}${shortPatients.length > 4 ? `等${shortPatients.length}人` : ""}`
+    : "全部达到应排次数";
+
+  return {
+    tone,
+    title,
+    summary,
+    canApply: !hasBlocking && !hasCoreGap,
+    applyTitle,
+    applyDetail,
+    applyButtonText,
+    strategyAdvice: formatStrategyRestAdvice(strategyRestComparison),
+    checks: [
+      {
+        label: "患者治疗",
+        value: `${review.stats.treatmentCount}/${expectedTreatmentCount}`,
+        detail: `2周${twoWeekWorkingDays}个治疗日，${scheduledPatients}/${review.stats.patientCount}名患者已排入`,
+        facts: [
+          `2周应排${expectedTreatmentCount}次，实际${review.stats.treatmentCount}次`,
+          `折合每周应排${formatOneDecimal(expectedTreatmentPerWeek)}次，实际${formatOneDecimal(actualTreatmentPerWeek)}次`,
+          patientComplete && treatmentComplete ? "所有患者达到应排次数" : shortPatientDetail,
+          unscheduledPatientsText(review.stats.patientCount - scheduledPatients),
+        ],
+        tone: patientComplete && treatmentComplete ? "ok" : "danger",
+      },
+      {
+        label: "血滤目标",
+        value: `${review.stats.hdfActualCount}/${review.stats.hdfTargetCount}`,
+        detail: hdfMatched ? "2周目标一致" : "请补足血滤",
+        facts: [
+          `2周血滤目标${review.stats.hdfTargetCount}次，实际${review.stats.hdfActualCount}次`,
+          `折合每周目标${formatOneDecimal(hdfTargetPerWeek)}次，实际${formatOneDecimal(hdfActualPerWeek)}次`,
+          hdfTargetPatientCount ? `涉及${hdfTargetPatientCount}名血滤患者` : "本轮没有血滤目标患者",
+          `血滤差额${hdfShortCount}次`,
+          hdfMatched ? "同患者同机器会尽量保持" : `还差${hdfShortCount}次血滤`,
+        ],
+        tone: hdfMatched ? "ok" : "danger",
+      },
+      {
+        label: "医护负担",
+        value: staffWithDuties.length ? `最多${maxShiftCount}个半日班` : "未排医护",
+        detail: staffWithDuties.length ? `2周${twoWeekHalfDaySlots}个半日窗口，最少${minRestDays}天整日休息` : "请检查医护排班",
+        facts: staffWithDuties.length ? [
+          "上午1班、下午1班，整日2班",
+          `2周总计${totalStaffShiftCount}个半日岗位，平均${formatOneDecimal(averageStaffShiftCount)}个/人`,
+          `折合每周${formatOneDecimal(totalStaffShiftCount / 2)}个半日岗位`,
+          `当前护士上班方式：${getStaffWorkModeLabel()}`,
+          `本轮完全无班护士${unusedNurseCount}名`,
+          "休息天指周一至周六全天无班",
+        ] : [],
+        tone: staffWithDuties.length ? hasStaffLoadWarning ? "warning" : "ok" : "danger",
+      },
+      {
+        label: "运行风险",
+        value: hasBlocking ? `${blockingCount}项阻止` : hasWarnings ? `${warningCount}项提醒` : hasStaffLoadWarning ? "医护需复核" : "无提醒",
+        detail: hasBlocking ? "先处理后再运行" : needsNurseManagerReview ? "复核后可运行" : "可持续运行",
+        facts: [
+          `按2周循环边界检查：第2周后回到第1周`,
+          blockingCount ? `阻止项${blockingCount}个，不能直接保存` : "没有阻止保存的问题",
+          warningCount ? `提醒项${warningCount}个，需要人工确认` : "没有额外提醒项",
+          hasBlocking ? "先处理阻止项再保存" : "请先看下方问题列表",
+        ],
+        tone: hasBlocking ? "danger" : needsNurseManagerReview ? "warning" : "ok",
+      },
+    ],
+  };
+}
+
+function unscheduledPatientsText(count) {
+  return count > 0 ? `还有${count}名患者未排入` : "没有漏排患者";
+}
+
+function formatOneDecimal(value) {
+  if (!Number.isFinite(value)) return "0";
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function buildTwoWeekStrategyRestComparison() {
+  const originalPriority = state.settings.schedulePriority;
+  const originalStaffWorkMode = normalizeStaffWorkMode(state.settings.staffWorkMode);
+  const patientSnapshot = structuredClone(state.patients || []);
+  const priorities = [SCHEDULE_PRIORITY_PATIENT, SCHEDULE_PRIORITY_STAFF, SCHEDULE_PRIORITY_SMART];
+  const staffModes = [STAFF_WORK_MODE_BALANCED, STAFF_WORK_MODE_FULL_DAY, STAFF_WORK_MODE_REST_MAX];
+  const results = [];
+  const modeResults = [];
+
+  try {
+    priorities.forEach((priority) => {
+      state.settings.schedulePriority = priority;
+      state.settings.staffWorkMode = originalStaffWorkMode;
+      const patientResult = buildTwoWeekPatientSchedules();
+      if (patientResult.blocking?.length) {
+        results.push({
+          priority,
+          ok: false,
+          label: getSchedulePriorityLabel(priority),
+          reason: `${patientResult.blocking.length}项患者排班阻止`,
+        });
+        return;
+      }
+
+      const staffResult = buildTwoWeekStaffSchedules(patientResult);
+      if (staffResult.blocking?.length) {
+        results.push({
+          priority,
+          ok: false,
+          label: getSchedulePriorityLabel(priority),
+          reason: `${staffResult.blocking.length}项医护排班阻止`,
+        });
+        return;
+      }
+
+      results.push({
+        priority,
+        ok: true,
+        label: getSchedulePriorityLabel(priority),
+        metrics: getTwoWeekNurseRestMetrics(staffResult),
+      });
+    });
+
+    staffModes.forEach((mode) => {
+      state.settings.schedulePriority = originalPriority;
+      state.settings.staffWorkMode = mode;
+      const patientResult = buildTwoWeekPatientSchedules();
+      if (patientResult.blocking?.length) {
+        modeResults.push({
+          mode,
+          ok: false,
+          label: getStaffWorkModeLabel(mode),
+          reason: `${patientResult.blocking.length}项患者排班阻止`,
+        });
+        return;
+      }
+
+      const staffResult = buildTwoWeekStaffSchedules(patientResult);
+      if (staffResult.blocking?.length) {
+        modeResults.push({
+          mode,
+          ok: false,
+          label: getStaffWorkModeLabel(mode),
+          reason: `${staffResult.blocking.length}项医护排班阻止`,
+        });
+        return;
+      }
+
+      modeResults.push({
+        mode,
+        ok: true,
+        label: getStaffWorkModeLabel(mode),
+        metrics: getTwoWeekNurseRestMetrics(staffResult),
+      });
+    });
+  } finally {
+    state.settings.schedulePriority = originalPriority;
+    state.settings.staffWorkMode = originalStaffWorkMode;
+    state.patients = patientSnapshot;
+  }
+
+  const valid = results.filter((item) => item.ok && item.metrics);
+  const validModes = modeResults.filter((item) => item.ok && item.metrics);
+  const orderedModesByRest = [...validModes].sort((left, right) =>
+    left.metrics.totalWorkedDays - right.metrics.totalWorkedDays ||
+    right.metrics.totalRestDays - left.metrics.totalRestDays ||
+    left.metrics.totalHalfDayShifts - right.metrics.totalHalfDayShifts ||
+    left.metrics.maxShiftCount - right.metrics.maxShiftCount,
+  );
+  const orderedModesByUnusedNurses = [...validModes].sort((left, right) =>
+    right.metrics.unusedNurseCount - left.metrics.unusedNurseCount ||
+    left.metrics.maxShiftCount - right.metrics.maxShiftCount ||
+    left.metrics.totalWorkedDays - right.metrics.totalWorkedDays,
+  );
+  const modeBest = orderedModesByRest[0] || null;
+  const modeWorst = orderedModesByRest[orderedModesByRest.length - 1] || null;
+  const modeMostUnused = orderedModesByUnusedNurses[0] || null;
+  const modeLeastUnused = orderedModesByUnusedNurses[orderedModesByUnusedNurses.length - 1] || null;
+  if (!valid.length) {
+    return {
+      results,
+      modeResults,
+      best: null,
+      worst: null,
+      modeBest,
+      modeWorst,
+      modeMostUnused,
+      modeLeastUnused,
+      improvedNurseCount: 0,
+      extraRestDays: 0,
+    };
+  }
+
+  const orderedByRest = [...valid].sort((left, right) =>
+    left.metrics.totalHalfDayShifts - right.metrics.totalHalfDayShifts ||
+    left.metrics.totalWorkedDays - right.metrics.totalWorkedDays ||
+    left.metrics.maxShiftCount - right.metrics.maxShiftCount,
+  );
+  const best = orderedByRest[0];
+  const worst = orderedByRest[orderedByRest.length - 1];
+  let improvedNurseCount = 0;
+  Object.entries(best.metrics.shiftCountByNurseId).forEach(([staffId, bestShiftCount]) => {
+    const worstShiftCount = worst.metrics.shiftCountByNurseId[staffId] ?? bestShiftCount;
+    if (bestShiftCount < worstShiftCount) improvedNurseCount += 1;
+  });
+  const savedHalfDayShifts = Math.max(0, worst.metrics.totalHalfDayShifts - best.metrics.totalHalfDayShifts);
+
+  return {
+    results,
+    best,
+    worst,
+    modeResults,
+    modeBest,
+    modeWorst,
+    modeMostUnused,
+    modeLeastUnused,
+    improvedNurseCount,
+    savedHalfDayShifts,
+    extraRestHalfDays: savedHalfDayShifts,
+    extraRestDays: Math.max(0, best.metrics.totalRestDays - worst.metrics.totalRestDays),
+    modeExtraRestDays: modeBest && modeWorst ? Math.max(0, modeBest.metrics.totalRestDays - modeWorst.metrics.totalRestDays) : 0,
+    modeReducedWorkedDays: modeBest && modeWorst ? Math.max(0, modeWorst.metrics.totalWorkedDays - modeBest.metrics.totalWorkedDays) : 0,
+    modeExtraUnusedNurses: modeBest && modeWorst ? Math.max(0, modeBest.metrics.unusedNurseCount - modeWorst.metrics.unusedNurseCount) : 0,
+    modeUnusedNurseGain: modeMostUnused && modeLeastUnused ? Math.max(0, modeMostUnused.metrics.unusedNurseCount - modeLeastUnused.metrics.unusedNurseCount) : 0,
+  };
+}
+
+function getTwoWeekNurseRestMetrics(staffResult) {
+  const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
+  const rows = nurses.map((staff) => {
+    const workedDays = new Set();
+    let shiftCount = 0;
+    for (const [weekNumber, staffWeek] of [[1, staffResult.week1], [2, staffResult.week2]]) {
+      WORKING_DAY_KEYS.forEach((dayKey) => {
+        STAFF_SHIFT_KEYS.forEach((shift) => {
+          const entry = staffWeek?.[dayKey]?.[shift] || {};
+          if ((entry.nurses || []).includes(staff.id) || entry.backupNurse === staff.id) {
+            workedDays.add(`${weekNumber}-${dayKey}`);
+            shiftCount += 1;
+          }
+        });
+      });
+    }
+    return {
+      staffId: staff.id,
+      name: staff.name,
+      workedDays: workedDays.size,
+      restDays: Math.max(0, 12 - workedDays.size),
+      shiftCount,
+    };
+  });
+
+  const halfDaySlotsPerNurse = WORKING_DAY_KEYS.length * STAFF_SHIFT_KEYS.length * 2;
+  const totalHalfDayShifts = rows.reduce((sum, row) => sum + row.shiftCount, 0);
+  const totalRestHalfDays = Math.max(0, rows.length * halfDaySlotsPerNurse - totalHalfDayShifts);
+
+  return {
+    nurseCount: rows.length,
+    totalHalfDayShifts,
+    totalRestHalfDays,
+    averageShiftCount: rows.length ? totalHalfDayShifts / rows.length : 0,
+    totalRestDays: rows.reduce((sum, row) => sum + row.restDays, 0),
+    totalWorkedDays: rows.reduce((sum, row) => sum + row.workedDays, 0),
+    unusedNurseCount: rows.filter((row) => row.shiftCount === 0).length,
+    minRestDays: rows.length ? Math.min(...rows.map((row) => row.restDays)) : 0,
+    maxShiftCount: rows.length ? Math.max(...rows.map((row) => row.shiftCount)) : 0,
+    shiftCountByNurseId: rows.reduce((result, row) => {
+      result[row.staffId] = row.shiftCount;
+      return result;
+    }, {}),
+    restDaysByNurseId: rows.reduce((result, row) => {
+      result[row.staffId] = row.restDays;
+      return result;
+    }, {}),
+  };
+}
+
+function formatStrategyRestAdvice(comparison) {
+  if (!comparison?.best) {
+    return "三种排班策略都没有形成可比较的完整方案，请先处理阻止项。";
+  }
+  const best = comparison.best;
+  const worst = comparison.worst;
+  const restSummary = comparison.results
+    .filter((item) => item.ok && item.metrics)
+    .map((item) => `${item.label}${item.metrics.totalHalfDayShifts}个护士半日班、${item.metrics.totalRestDays}个整日休息`)
+    .join("，");
+  const strategyText = !worst || best.priority === worst.priority
+    ? `三种排班策略对比：${restSummary}。结果：当前数据下三种策略差异不大。`
+    : comparison.savedHalfDayShifts > 0
+      ? `三种排班策略对比：${restSummary}。护士半日班最少的是${best.label}；相比${worst.label}，可让${comparison.improvedNurseCount}名护士少上半天班，合计少排${comparison.savedHalfDayShifts}个半日班。`
+      : `三种排班策略对比：${restSummary}。结果：三种可行策略的护士半日岗位总量相同，主要差别在完整休息日和班次集中程度。`;
+
+  const modeBest = comparison.modeBest;
+  const modeWorst = comparison.modeWorst;
+  const modeSummary = (comparison.modeResults || [])
+    .filter((item) => item.ok && item.metrics)
+    .map((item) => `${item.label}${item.metrics.totalRestDays}个整日休息、${item.metrics.unusedNurseCount}名护士本轮无班、最多${item.metrics.maxShiftCount}个半日班/人`)
+    .join("，");
+  if (!modeBest || !modeWorst || !modeSummary) {
+    return `${strategyText} 护士上班方式暂时没有形成可比较结果。`;
+  }
+  if (modeBest.mode === modeWorst.mode || comparison.modeReducedWorkedDays <= 0) {
+    if (comparison.modeUnusedNurseGain > 0 && comparison.modeMostUnused && comparison.modeLeastUnused) {
+      return `${strategyText} 护士上班方式对比：${modeSummary}。总整日休息数接近；如果目标是让一部分护士本轮完整休息不来上班，${comparison.modeMostUnused.label}可比${comparison.modeLeastUnused.label}多让${comparison.modeUnusedNurseGain}名护士本轮无班，但最多会到${comparison.modeMostUnused.metrics.maxShiftCount}个半日班/人，护士长需要确认公平性。`;
+    }
+    return `${strategyText} 护士上班方式对比：${modeSummary}。结果：完整休息日差异不明显，建议按科室公平性选择。`;
+  }
+  return `${strategyText} 护士上班方式对比：${modeSummary}。完整休息日最多的是${modeBest.label}；相比${modeWorst.label}，可减少${comparison.modeReducedWorkedDays}个“有人来上班的日子”，多出${comparison.modeExtraRestDays}个护士整日休息，另可多让${comparison.modeExtraUnusedNurses}名护士本轮完全不排班。`;
+}
+
+function renderTreatmentTagList(sessions = []) {
+  if (!sessions.length) return '<span class="two-week-empty-note">未排入</span>';
+  return `<div class="two-week-tag-list">${sessions.map((session) => {
+    const treatmentType = normalizeMachineType(session.treatmentType);
+    const tone = treatmentType === "hemofiltration" ? "hdf" : "";
+    const label = formatTwoWeekReviewTreatmentLabel(session, `${session.machineId}号机 ${getTreatmentLabel(treatmentType)}`);
+    return `<span class="two-week-detail-tag ${tone}">${escapeHtml(label)}</span>`;
+  }).join("")}</div>`;
+}
+
+function renderDutyTagList(duties = []) {
+  if (!duties.length) return '<span class="two-week-empty-note">未排班</span>';
+  return `<div class="two-week-tag-list">${duties.map((duty) => {
+    const tone = duty.role === "医生" ? "doctor" : duty.role === "后备护士" ? "backup" : "nurse";
+    const label = formatTwoWeekReviewTreatmentLabel(duty, duty.role);
+    return `<span class="two-week-detail-tag ${tone}">${escapeHtml(label)}</span>`;
+  }).join("")}</div>`;
+}
+
+function simplifyTwoWeekReviewIssue(message, review = null) {
+  const text = String(message || "").replace(/\s+/g, " ").trim();
+  const weekLabel = text.match(/第[12]周/)?.[0] || "";
+  const plain = (value) => ({ text: value, html: false });
+  const html = (value) => ({ text: value, html: true });
+
+  if (text.includes("集中排班") && (text.includes("已自动回退到安全均衡日期") || text.includes("患者优先安全排班") || text.includes("医护优先排班法"))) {
+    const modeLabel = text.match(/(灵巧排班|医护优先)集中排班/)?.[1] || "当前策略";
+    const patientItems = extractUnassignedPatientItems(text);
+    const finalSummary = formatFallbackFinalScheduleSummary(patientItems, weekLabel, review);
+    const fallbackText = text.includes("医护优先仍放不下")
+      ? "系统先尝试医护优先排班法；医护优先仍放不下，所以最后改用患者优先安全排班：先按患者资料里设置的星期几倾向排；这个星期几放不下时，才调整到其他工作日。"
+      : text.includes("医护优先排班法")
+      ? "系统已优先改用医护优先排班法：尽量让医护少开班、多休息，同时仍遵守患者分区、血滤和治疗间隔。"
+      : "系统已改用患者优先安全排班：先按患者资料里设置的星期几倾向排；这个星期几放不下时，才调整到其他工作日。";
+    return html(`
+      <div class="two-week-human-issue">
+        <p><b>${escapeHtml(weekLabel || "本周")}</b>：按${escapeHtml(modeLabel)}集中排时，有些治疗放不下。${escapeHtml(fallbackText)}</p>
+        ${finalSummary || '<p><b>请重点看</b>：血滤机、传染/非传染分区、严重组和治疗间隔。</p>'}
+      </div>
+    `);
+  }
+
+  if (text.includes("医护排班采用整日优先")) {
+    return plain(`${weekLabel ? `${weekLabel}：` : ""}医护按整日优先安排，下午会尽量沿用上午同一批人员。`);
+  }
+
+  if (text.includes("医护排班采用休息最大化")) {
+    return plain(`${weekLabel ? `${weekLabel}：` : ""}医护按休息最大化安排，会优先让同一批护士上整日班，把休息尽量留成完整一天；请护士长复核个别人班次是否偏多。`);
+  }
+
+  if (text.includes("未设置星期，已按每周")) {
+    return plain(text.replace("默认透析日：", "").replace("未设置星期，已按", "没有设置星期几倾向，系统已按"));
+  }
+
+  if (text.includes("没有完整间隔一天")) {
+    return plain(text.replace("在第2周末与下一轮第1周初之间没有完整间隔一天。", "第2周末和下一轮第1周初离得太近，请人工确认间隔。"));
+  }
+
+  if (text.includes("未找到可用血滤机")) {
+    return plain(text.replace("请检查血滤机数量、分区和暂停机器。", "请检查血滤机是否够用、分区是否合适、机器是否暂停。"));
+  }
+
+  return plain(text
+    .replace("系统已尝试固定机位、推荐机位和全部兼容机位；", "")
+    .replace("请检查该患者分区、治疗类型、血滤机数量、暂停机器和同日治疗间隔。", "请检查患者分区、治疗类型、血滤机、暂停机器和治疗间隔。"));
+}
+
+function extractUnassignedPatientItems(text) {
+  const raw = text.match(/治疗次数未能安排：(.+?)(?:。|；|$)/)?.[1] || "";
+  if (!raw) return [];
+  return raw.split("、").map((item) => item.trim()).filter(Boolean).map((item) => {
+    const match = item.match(/^(.+?)（原(.+?)）$/);
+    return {
+      name: match?.[1] || item,
+      originalDayLabel: match?.[2] || "",
+    };
+  });
+}
+
+function formatFallbackFinalScheduleSummary(items = [], weekLabel = "", review = null) {
+  if (!items.length || !review?.patientRows?.length) return "";
+  const weekNumber = Number(weekLabel.match(/\d+/)?.[0]) || null;
+  const analyzedItems = items.map((item) => {
+    const row = review.patientRows.find((patientRow) => patientRow.name === item.name);
+    const weekSessions = (row?.sessions || []).filter((session) =>
+      !weekNumber || Number(session.weekNumber) === weekNumber
+    );
+    const finalSlots = dedupeMessages(weekSessions.map((session) =>
+      `${getWeekDayLabel(session.dayKey)}${SHIFT_LABELS[session.shift] || ""}`
+    ));
+    if (!finalSlots.length) {
+      return { ...item, finalSlots, keptOriginalDay: false, notScheduled: true };
+    }
+    const keptOriginalDay = item.originalDayLabel &&
+      weekSessions.some((session) => getWeekDayLabel(session.dayKey) === item.originalDayLabel);
+    return { ...item, finalSlots, keptOriginalDay, notScheduled: false };
+  });
+
+  const keptGroups = new Map();
+  analyzedItems
+    .filter((item) => item.keptOriginalDay)
+    .forEach((item) => {
+      const dayLabel = item.originalDayLabel || "原日期";
+      keptGroups.set(dayLabel, [...(keptGroups.get(dayLabel) || []), item.name]);
+    });
+  const keptSummary = [...keptGroups.entries()].map(([dayLabel, names]) =>
+    `${names.join("、")}仍按设置的${dayLabel}安排`
+  );
+
+  const changedSummary = analyzedItems
+    .filter((item) => !item.keptOriginalDay && !item.notScheduled)
+    .slice(0, 6)
+    .map((item) =>
+      `${item.name}：设置的是${item.originalDayLabel || "原星期几"}，最终安排到${item.finalSlots.join("、")}`
+    );
+  const notScheduledSummary = analyzedItems
+    .filter((item) => item.notScheduled)
+    .map((item) => `${item.name}本周没有排进去`);
+
+  const hiddenChangedCount = analyzedItems.filter((item) => !item.keptOriginalDay && !item.notScheduled).length - changedSummary.length;
+  const parts = [];
+  if (keptSummary.length) {
+    parts.push(`<p><b>星期几倾向保留</b>：${escapeHtml(keptSummary.join("；"))}。</p>`);
+  }
+  if (changedSummary.length) {
+    parts.push(`<p><b>星期几倾向调整</b>：${escapeHtml(changedSummary.join("；"))}。</p>`);
+  }
+  if (notScheduledSummary.length) {
+    parts.push(`<p><b>没有排入</b>：${escapeHtml(notScheduledSummary.join("；"))}。</p>`);
+  }
+  if (hiddenChangedCount > 0) {
+    parts.push(`<p><b>还有调整</b>：另有 ${hiddenChangedCount} 项日期已调整，请看下方明细。</p>`);
+  }
+  if (!parts.length) return "";
+  parts.push('<p class="two-week-human-note">这里比较的是“患者设置的星期几倾向”和“最终安排的星期几”；具体上午/下午、机位、血透/血滤，请看下面患者明细。</p>');
+  return parts.join("");
+}
+
+function formatTwoWeekReviewTreatmentLabel(item, suffix) {
+  const date = getTwoWeekReviewItemDate(item);
+  const weekText = formatYearWeekLabel(date);
+  const weekdayText = getWeekDayLabel(item.dayKey);
+  const shiftText = SHIFT_LABELS[item.shift] || "";
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${weekText} ${weekdayText}${shiftText} ${suffix}`;
+}
+
+function getTwoWeekReviewItemDate(item) {
+  const weekStart = getWeekStart(parseDateInput(getCurrentDate()));
+  const dayOffset = Math.max(0, WORKING_DAY_KEYS.indexOf(String(item.dayKey)));
+  const weekOffset = Math.max(0, Number(item.weekNumber || 1) - 1) * 7;
+  return addDays(weekStart, weekOffset + dayOffset);
+}
+
+function formatYearWeekLabel(date) {
+  const selectedYear = parseDateInput(getCurrentDate()).getFullYear();
+  const iso = getIsoWeekInfo(date);
+  if (iso.year !== date.getFullYear()) {
+    return `跨年周（${iso.year}年第${iso.week}周）`;
+  }
+  const prefix = iso.year === selectedYear ? "今年" : `${iso.year}年`;
+  return `${prefix}第${iso.week}周`;
+}
+
+function getIsoWeekNumber(date) {
+  return getIsoWeekInfo(date).week;
+}
+
+function getIsoWeekInfo(date) {
+  const target = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const day = target.getUTCDay() || 7;
+  target.setUTCDate(target.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1));
+  return {
+    year: target.getUTCFullYear(),
+    week: Math.ceil((((target - yearStart) / 86400000) + 1) / 7),
+  };
+}
+
+function printTwoWeekReview() {
+  if (!ui.twoWeekReviewDialog.open) return;
+  document.body.classList.add("printing-two-week-review");
+  window.print();
+  setTimeout(() => document.body.classList.remove("printing-two-week-review"), 300);
+}
+
 function renderSummary() {
   const date = getCurrentDate();
   const machines = getMachineIds();
   const daySchedule = getEffectiveScheduleForDate(date);
   const morningCount = countAssigned(daySchedule, machines, "morning");
   const afternoonCount = countAssigned(daySchedule, machines, "afternoon");
-  const activePatientList = state.patients.filter((patient) => patient.status === "active");
+  const activePatientList = getSchedulablePatients();
   const activePatients = activePatientList.length;
   const severePatients = activePatientList.filter(isSeverePatient).length;
   const pausedCount = getPausedMachineIds().length;
@@ -1396,6 +3334,9 @@ function saveStaffInput(event) {
     daySchedule[shift].backupNurse = value;
   }
 
+  if (scope === "weekly") {
+    copyWeeklyViewBackToCycle();
+  }
   saveState();
   renderSummary();
   renderSchedule();
@@ -1433,6 +3374,173 @@ function createEmptyStaffScheduleDay(nurseCount) {
     };
     return result;
   }, {});
+}
+
+function getRequiredNurseCountForShift(patientDaySchedule = {}, shift, settings = state.settings) {
+  return getNurseGroupsForShift(patientDaySchedule, shift, settings)
+    .filter((group) => group && !group.empty && group.patientCount > 0)
+    .length;
+}
+
+function buildAutoWeeklyStaffSchedules(patientSchedules = {}, priority = state.settings.schedulePriority, options = {}) {
+  const schedules = {};
+  const warnings = [];
+  const blocking = [];
+  const doctors = state.staffMembers.filter((staff) => staff.role === "doctor" && staff.status === "active");
+  const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
+  const assignmentCounts = options.assignmentCounts instanceof Map ? options.assignmentCounts : new Map();
+  const nurseWorkedDays = options.nurseWorkedDays instanceof Map ? options.nurseWorkedDays : new Map();
+  const doctorWorkedDays = options.doctorWorkedDays instanceof Map ? options.doctorWorkedDays : new Map();
+  const periodPrefix = String(options.periodPrefix || "");
+  const staffWorkMode = normalizeStaffWorkMode(state.settings.staffWorkMode);
+  const fullDayMode = staffWorkMode === STAFF_WORK_MODE_FULL_DAY || staffWorkMode === STAFF_WORK_MODE_REST_MAX;
+  const restMaxMode = staffWorkMode === STAFF_WORK_MODE_REST_MAX;
+  const restMaxSoftShiftCap = Number.isFinite(Number(options.restMaxSoftShiftCap))
+    ? Number(options.restMaxSoftShiftCap)
+    : periodPrefix ? 15 : 8;
+
+  [...doctors, ...nurses].forEach((staff) => {
+    if (!assignmentCounts.has(staff.id)) assignmentCounts.set(staff.id, 0);
+  });
+  doctors.forEach((staff) => {
+    if (!doctorWorkedDays.has(staff.id)) doctorWorkedDays.set(staff.id, new Set());
+  });
+  nurses.forEach((staff) => {
+    if (!nurseWorkedDays.has(staff.id)) nurseWorkedDays.set(staff.id, new Set());
+  });
+
+  const getWorkedDays = (staff, role) => role === "doctor"
+    ? doctorWorkedDays.get(staff.id) || new Set()
+    : nurseWorkedDays.get(staff.id) || new Set();
+
+  const markSelected = (staffIds, dayKey, role) => {
+    const dayToken = `${periodPrefix}${dayKey}`;
+    staffIds.filter(Boolean).forEach((staffId) => {
+      assignmentCounts.set(staffId, (assignmentCounts.get(staffId) || 0) + 1);
+      const workedDays = role === "doctor"
+        ? doctorWorkedDays.get(staffId) || new Set()
+        : nurseWorkedDays.get(staffId) || new Set();
+      workedDays.add(dayToken);
+      if (role === "doctor") {
+        doctorWorkedDays.set(staffId, workedDays);
+      } else {
+        nurseWorkedDays.set(staffId, workedDays);
+      }
+    });
+  };
+
+  const selectStaff = (pool, count, shift, dayKey, role, exclude = new Set(), sameDayPreferred = new Set()) => {
+    const dayToken = `${periodPrefix}${dayKey}`;
+    return pool
+      .filter((staff) => !exclude.has(staff.id))
+      .map((staff) => {
+        const workedDays = getWorkedDays(staff, role);
+        const preferredShiftScore = scoreShiftPreference(staff, shift);
+        const currentAssignments = assignmentCounts.get(staff.id) || 0;
+        const hasWorkedThisDay = workedDays.has(dayToken);
+        const hasAnyAssignment = currentAssignments > 0;
+        const fullDayBonus = fullDayMode && shift === "afternoon" && sameDayPreferred.has(staff.id)
+          ? restMaxMode ? -160 : -80
+          : 0;
+        const balancedSameDayPenalty = !fullDayMode && shift === "afternoon" && workedDays.has(dayToken) ? 12 : 0;
+        const restMaxUnusedPenalty = restMaxMode && !hasAnyAssignment ? 70 : 0;
+        const restMaxNewDayPenalty = restMaxMode && !hasWorkedThisDay ? 35 : 0;
+        const restMaxOverCapPenalty = restMaxMode && currentAssignments >= restMaxSoftShiftCap
+          ? (currentAssignments - restMaxSoftShiftCap + 1) * 95
+          : 0;
+        const restMaxLoadScore = restMaxMode
+          ? currentAssignments * 3 + workedDays.size * 2
+          : currentAssignments * 20 + workedDays.size * 5;
+        return {
+          staff,
+          score:
+            fullDayBonus +
+            balancedSameDayPenalty +
+            restMaxUnusedPenalty +
+            restMaxNewDayPenalty +
+            restMaxOverCapPenalty +
+            restMaxLoadScore -
+            preferredShiftScore * 2,
+        };
+      })
+      .sort((left, right) => left.score - right.score || sortStaffMembers(left.staff, right.staff))
+      .slice(0, Math.max(0, count))
+      .map((item) => item.staff.id);
+  };
+
+  let activeShiftCount = 0;
+  let doctorShiftCount = 0;
+  let nurseShiftCount = 0;
+  let backupShiftCount = 0;
+
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    const patientDaySchedule = patientSchedules?.[dayKey] || {};
+    const staffDaySchedule = createEmptyStaffScheduleDay(0);
+    const morningDoctorIds = new Set();
+    const morningNurseIds = new Set();
+
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const patientCount = countAssigned(patientDaySchedule, getMachineIds(), shift);
+      if (!patientCount) {
+        staffDaySchedule[shift] = { doctors: [], nurses: [], backupNurse: "" };
+        return;
+      }
+
+      const requiredNurses = getRequiredNurseCountForShift(patientDaySchedule, shift);
+      activeShiftCount += 1;
+      if (doctors.length < DOCTOR_COUNT) {
+        blocking.push(`${getWeekDayLabel(dayKey)}${SHIFT_LABELS[shift]}需要 ${DOCTOR_COUNT} 名医生，当前在岗医生 ${doctors.length} 名。`);
+      }
+      if (nurses.length < requiredNurses + BACKUP_NURSE_COUNT) {
+        blocking.push(`${getWeekDayLabel(dayKey)}${SHIFT_LABELS[shift]}需要 ${requiredNurses} 名责任护士和 ${BACKUP_NURSE_COUNT} 名后备护士，当前在岗护士 ${nurses.length} 名。`);
+      }
+
+      const sameDayDoctors = shift === "afternoon" ? morningDoctorIds : new Set();
+      const sameDayNurses = shift === "afternoon" ? morningNurseIds : new Set();
+      const doctorsForShift = selectStaff(doctors, DOCTOR_COUNT, shift, dayKey, "doctor", new Set(), sameDayDoctors);
+      markSelected(doctorsForShift, dayKey, "doctor");
+      doctorsForShift.forEach((staffId) => {
+        if (shift === "morning") morningDoctorIds.add(staffId);
+      });
+
+      const nursesForShift = selectStaff(nurses, requiredNurses, shift, dayKey, "nurse", new Set(), sameDayNurses);
+      markSelected(nursesForShift, dayKey, "nurse");
+      nursesForShift.forEach((staffId) => {
+        if (shift === "morning") morningNurseIds.add(staffId);
+      });
+
+      const backupNurse = selectStaff(nurses, BACKUP_NURSE_COUNT, shift, dayKey, "nurse", new Set(nursesForShift), sameDayNurses)[0] || "";
+      markSelected([backupNurse], dayKey, "nurse");
+      if (shift === "morning" && backupNurse) morningNurseIds.add(backupNurse);
+
+      staffDaySchedule[shift] = {
+        doctors: doctorsForShift,
+        nurses: nursesForShift,
+        backupNurse,
+      };
+      doctorShiftCount += doctorsForShift.length;
+      nurseShiftCount += nursesForShift.length;
+      backupShiftCount += backupNurse ? 1 : 0;
+    });
+
+    schedules[dayKey] = staffDaySchedule;
+  });
+
+  if (restMaxMode) {
+    warnings.push("医护排班采用休息最大化：优先把上午、下午集中给同一批人员，让更多护士获得完整休息日；护士长需复核个别人班次是否偏多。");
+  } else if (fullDayMode) {
+    warnings.push("医护排班采用整日优先：下午班会优先沿用当天上午已排人员。");
+  }
+
+  return {
+    schedules,
+    warnings,
+    blocking: dedupeMessages(blocking),
+    activeShiftCount,
+    doctorShiftCount,
+    nurseShiftCount,
+    backupShiftCount,
+  };
 }
 
 function getStaffCoverage(date) {
@@ -1620,6 +3728,7 @@ function renderShiftSlot(machineId, shift, assignment, conflictSet, scheduleCont
   const classes = [
     "shift-slot",
     patient ? "assigned" : "",
+    patient?.temporaryInsert ? "temporary-patient-slot" : "",
     isConflict ? "conflict" : "",
     machinePaused ? "paused-machine-slot" : "",
     nurseVisual ? "nurse-zone-linked" : "",
@@ -1632,6 +3741,7 @@ function renderShiftSlot(machineId, shift, assignment, conflictSet, scheduleCont
   const content = patient
     ? `
       <div class="slot-patient">${escapeHtml(patient.name)}</div>
+      ${patient.temporaryInsert ? `<span class="slot-temporary-badge">临时插入</span>` : ""}
       <div class="patient-subline">${escapeHtml(buildPatientSubline(patient))}</div>
       ${assignment.note ? `<div class="slot-note">${escapeHtml(assignment.note)}</div>` : ""}
     `
@@ -1685,7 +3795,7 @@ function openAssignmentDialog(machineId, shift) {
     .filter((patient) => patient.id === assignment.patientId || (patient.status === "active" && patientFitsMachine(patient, machineId)))
     .sort(sortPatients)
     .map((patient) => {
-      const details = [patient.dialysisNo, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), patient.vascularAccess, patient.infectionFlag, formatPreference(patient.preferredShift, patient.preferredDays)]
+      const details = [patient.dialysisNo, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), patient.vascularAccess, patient.infectionFlag, formatPreference(patient.preferredShift, patient.preferredDays, patient.forcePreferredDays)]
         .filter(Boolean)
         .join(" · ");
       const label = details ? `${patient.name} (${details})` : patient.name;
@@ -1779,6 +3889,9 @@ function saveAssignment() {
   }
 
   pruneEmptySchedule(targetSchedule, targetKey, machineId);
+  if (scope === "weekly") {
+    copyWeeklyViewBackToCycle();
+  }
   saveState();
   ui.assignmentDialog.close();
   renderWeekNavigation();
@@ -1812,6 +3925,9 @@ function removeAssignment() {
   const targetKey = scope === "weekly" ? getWeekdayKey(date) : date;
   clearScheduleSlot(targetSchedule, targetKey, machineId, shift, scope === "date" && Boolean(getWeeklySlot(date, machineId, shift)));
   pruneEmptySchedule(targetSchedule, targetKey, machineId);
+  if (scope === "weekly") {
+    copyWeeklyViewBackToCycle();
+  }
   saveState();
   ui.assignmentDialog.close();
   renderWeekNavigation();
@@ -1845,6 +3961,337 @@ function syncMonthlyHdfAvailability() {
     : "常规治疗不是血透时，不再另行生成月度血滤";
 }
 
+function getInsertFormField(name) {
+  return ui.insertPatientForm?.elements?.[name] || null;
+}
+
+function getInsertCheckedDays() {
+  return [...(ui.insertPatientForm?.querySelectorAll('input[name="preferredDays"]:checked') || [])]
+    .map((input) => input.value);
+}
+
+function setInsertCheckedDays(values = []) {
+  const selected = new Set(values.map(String));
+  ui.insertPatientForm?.querySelectorAll('input[name="preferredDays"]').forEach((input) => {
+    input.checked = selected.has(input.value);
+  });
+}
+
+function openInsertPatientDialog() {
+  ui.insertPatientForm.reset();
+  getInsertFormField("scheduleScope").value = "date";
+  getInsertFormField("treatmentType").value = DEFAULT_MACHINE_TYPE;
+  getInsertFormField("weeklyTreatmentCount").value = "3";
+  getInsertFormField("monthlyHdfCount").value = "1";
+  getInsertFormField("careLevel").value = STANDARD_CARE_LEVEL;
+  const currentDayKey = getWeekdayKey(getCurrentDate());
+  setInsertCheckedDays(WORKING_DAY_KEYS.includes(currentDayKey) ? [currentDayKey] : []);
+  renderMachineOptionsForSelect(getInsertFormField("fixedMachineId"), "", "首次自动排班后固定");
+  syncInsertMonthlyHdfAvailability();
+  ui.insertPatientDialog.showModal();
+}
+
+function closeInsertPatientDialog() {
+  ui.insertPatientDialog.close();
+}
+
+function syncInsertMonthlyHdfAvailability() {
+  const treatmentType = getInsertFormField("treatmentType");
+  const monthlyHdfCount = getInsertFormField("monthlyHdfCount");
+  if (!treatmentType || !monthlyHdfCount) return;
+  const supportsMonthlyHdf = treatmentType.value === DEFAULT_MACHINE_TYPE;
+  monthlyHdfCount.disabled = !supportsMonthlyHdf;
+  if (!supportsMonthlyHdf) {
+    monthlyHdfCount.value = "0";
+  }
+}
+
+function createPatientFromInsertForm() {
+  const selectedFixedMachine = String(getInsertFormField("fixedMachineId")?.value || "").trim();
+  const scheduleScope = getInsertFormField("scheduleScope")?.value === "longTerm" ? "longTerm" : "date";
+  const preferredDays = getInsertCheckedDays();
+  const currentDayKey = getWeekdayKey(getCurrentDate());
+  const patient = normalizePatient({
+    id: createId(),
+    name: getInsertFormField("name")?.value,
+    dialysisNo: getInsertFormField("dialysisNo")?.value,
+    gender: getInsertFormField("gender")?.value,
+    age: getInsertFormField("age")?.value,
+    phone: getInsertFormField("phone")?.value,
+    dryWeight: getInsertFormField("dryWeight")?.value,
+    vascularAccess: getInsertFormField("vascularAccess")?.value,
+    treatmentType: getInsertFormField("treatmentType")?.value,
+    weeklyTreatmentCount: getInsertFormField("weeklyTreatmentCount")?.value,
+    monthlyHdfCount: getInsertFormField("monthlyHdfCount")?.value,
+    status: "active",
+    infectionFlag: getInsertFormField("infectionFlag")?.value,
+    careLevel: getInsertFormField("careLevel")?.value,
+    preferredShift: getInsertFormField("preferredShift")?.value,
+    fixedMachineId: selectedFixedMachine,
+    fixedMachineLockedAt: selectedFixedMachine ? new Date().toISOString() : "",
+    preferredDays: preferredDays.length ? preferredDays : WORKING_DAY_KEYS.includes(currentDayKey) ? [currentDayKey] : [],
+    forcePreferredDays: Boolean(getInsertFormField("forcePreferredDays")?.checked),
+    temporaryInsert: scheduleScope === "date",
+    note: getInsertFormField("note")?.value,
+    updatedAt: new Date().toISOString(),
+  });
+  return { patient, scheduleScope };
+}
+
+function validateInsertPatient(patient, scheduleScope) {
+  const problems = [];
+  if (!patient) {
+    problems.push("请先填写患者姓名。");
+    return problems;
+  }
+  if (scheduleScope === "date" && !WORKING_DAY_KEYS.includes(getWeekdayKey(getCurrentDate()))) {
+    problems.push("当前日期是周日休息日，不能临时插入治疗；请先切换到周一至周六。");
+  }
+  if (patient.fixedMachineId) {
+    if (!getMachineIds().includes(patient.fixedMachineId)) {
+      problems.push(`${patient.name} 选择的固定机位 ${patient.fixedMachineId} 号机当前不存在。`);
+    } else if (isMachinePaused(patient.fixedMachineId)) {
+      problems.push(`${patient.name} 选择的固定机位 ${patient.fixedMachineId} 号机已暂停。`);
+    } else if (!patientFitsMachine(patient, patient.fixedMachineId)) {
+      problems.push(`${patient.name} 选择的固定机位 ${patient.fixedMachineId} 号机与治疗类型或分区不匹配。`);
+    }
+  }
+  if (scheduleScope === "longTerm") {
+    problems.push(...validateForcedPreferredDaysPatients([patient]));
+  }
+  return problems;
+}
+
+function handleInsertPatientSubmit(event) {
+  event.preventDefault();
+  if (event.submitter?.value === "cancel") {
+    ui.insertPatientDialog.close();
+    return;
+  }
+
+  const { patient, scheduleScope } = createPatientFromInsertForm();
+  const problems = validateInsertPatient(patient, scheduleScope);
+  if (problems.length) {
+    window.alert(`无法插入患者：\n\n${problems.map((item) => `- ${item}`).join("\n")}`);
+    return;
+  }
+
+  const duplicate = state.patients.find((item) => patient.dialysisNo && item.dialysisNo === patient.dialysisNo);
+  if (duplicate && !window.confirm(`透析号 ${patient.dialysisNo} 已属于 ${duplicate.name}。仍要插入这名患者吗？`)) {
+    return;
+  }
+
+  const result = scheduleScope === "longTerm"
+    ? insertLongTermPatient(patient)
+    : insertTemporaryDatePatient(patient);
+
+  if (!result.ok) {
+    window.alert(`无法插入患者：\n\n${result.messages.map((item) => `- ${item}`).join("\n")}`);
+    return;
+  }
+
+  ui.insertPatientDialog.close();
+  saveState();
+  renderPatientTable();
+  renderWeekNavigation();
+  renderStaffSchedule();
+  renderSchedule();
+  renderSummary();
+  showToast(result.message);
+}
+
+function insertTemporaryDatePatient(patient) {
+  const date = getCurrentDate();
+  const dayKey = getWeekdayKey(date);
+  const previousDay = getEffectiveScheduleForDate(date);
+  const direct = buildExactDayInsertion(patient, dayKey, previousDay, normalizeMachineType(patient.treatmentType));
+
+  if (direct.assignment) {
+    state.patients.push(patient);
+    setScheduleSlot(state.schedules, date, direct.assignment.machineId, direct.assignment.shift, {
+      patientId: patient.id,
+      treatmentType: normalizeMachineType(patient.treatmentType),
+      note: "临时插入患者",
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      ok: true,
+      message: `${patient.name} 已插入 ${formatDateLabel(date)} ${SHIFT_LABELS[direct.assignment.shift]} ${direct.assignment.machineId}号机，没有移动原有患者。`,
+    };
+  }
+
+  return {
+    ok: false,
+    messages: [
+      `${patient.name} 当前日期没有可用空位。${explainInsertionNoSlot(patient, dayKey, previousDay, normalizeMachineType(patient.treatmentType))} 系统不会为了新人移动已经排好的患者；请改选日期、班次、治疗类型、机位，或先由护士长手动腾出空位后再插入。`,
+    ],
+  };
+}
+
+function insertLongTermPatient(patient) {
+  ensureTwoWeekCycleState();
+  copyWeeklyViewBackToCycle();
+  const direct = buildLongTermNoMoveInsertionPlan(patient);
+  if (direct.ok) {
+    state.patients.push({ ...patient, temporaryInsert: false });
+    state.twoWeekCycle.patientSchedules.week1 = direct.patientSchedules.week1;
+    state.twoWeekCycle.patientSchedules.week2 = direct.patientSchedules.week2;
+    state.twoWeekCycle.savedAt = new Date().toISOString();
+    state.twoWeekCycle.anchorWeekStart = state.twoWeekCycle.anchorWeekStart || normalizeCycleAnchorWeekStart(getCurrentDate());
+    syncCycleWeekToWeeklyView();
+    return {
+      ok: true,
+      message: `${patient.name} 已加入长期2周循环，没有移动原有患者。`,
+    };
+  }
+
+  return {
+    ok: false,
+    messages: [
+      `${patient.name} 无法在现有长期2周循环中找到全程空位。系统不会为了新人移动已经排好的患者；请调整新人日期/班次/治疗类型/机位，或由护士长先手动腾出空位后再插入。`,
+    ],
+  };
+}
+
+function ensureTwoWeekCycleState() {
+  if (!state.twoWeekCycle) {
+    state.twoWeekCycle = structuredClone(DEFAULT_STATE.twoWeekCycle);
+  }
+  state.twoWeekCycle.patientSchedules ||= { week1: {}, week2: {} };
+  state.twoWeekCycle.staffSchedules ||= { week1: {}, week2: {} };
+  state.twoWeekCycle.patientSchedules.week1 ||= {};
+  state.twoWeekCycle.patientSchedules.week2 ||= {};
+  state.twoWeekCycle.staffSchedules.week1 ||= {};
+  state.twoWeekCycle.staffSchedules.week2 ||= {};
+}
+
+function buildExactDayInsertion(patient, dayKey, baseDaySchedule = {}, treatmentType = patient?.treatmentType) {
+  if (!WORKING_DAY_KEYS.includes(dayKey)) {
+    return { assignment: null, daySchedule: structuredClone(baseDaySchedule || {}) };
+  }
+  const schedules = { [dayKey]: structuredClone(baseDaySchedule || {}) };
+  const assignment = assignWeeklyPatientSession(
+    {
+      patient,
+      originalDay: dayKey,
+      requestedDay: dayKey,
+      lockedDay: true,
+      treatmentType: normalizeMachineType(treatmentType || patient.treatmentType),
+    },
+    schedules,
+    [...getAvailableMachineIds()].sort(sortMachineIds),
+    getSpecialMachines().filter((machineId) => !isMachinePaused(machineId)).sort(sortMachineIds),
+    getAvailableMachineIds().filter((machineId) => getMachineZone(machineId) === MACHINE_ZONE_NORMAL).sort(sortMachineIds),
+    new Map(),
+    new Map(),
+    SCHEDULE_PRIORITY_PATIENT,
+    false,
+  );
+  return { assignment, daySchedule: schedules[dayKey] || {} };
+}
+
+function buildLongTermNoMoveInsertionPlan(patient) {
+  const patientSchedules = {
+    week1: structuredClone(state.twoWeekCycle?.patientSchedules?.week1 || {}),
+    week2: structuredClone(state.twoWeekCycle?.patientSchedules?.week2 || {}),
+  };
+  const week1 = buildWeeklyInsertionForPatient(patient, patientSchedules.week1, 1);
+  if (!week1.ok) return week1;
+  const week2 = buildWeeklyInsertionForPatient(patient, patientSchedules.week2, 2);
+  if (!week2.ok) return week2;
+  return {
+    ok: true,
+    patientSchedules: {
+      week1: week1.schedules,
+      week2: week2.schedules,
+    },
+  };
+}
+
+function explainInsertionNoSlot(patient, dayKey, daySchedule = {}, treatmentType = patient?.treatmentType) {
+  if (!WORKING_DAY_KEYS.includes(String(dayKey))) {
+    return "当前日期不是治疗日。";
+  }
+  const normalizedTreatment = normalizeMachineType(treatmentType || patient?.treatmentType);
+  const compatibleMachines = getAvailableMachineIds()
+    .filter((machineId) => patientFitsMachineForTreatment(patient, normalizedTreatment, machineId))
+    .sort(sortMachineIds);
+  const dayLabel = getWeekDayLabel(String(dayKey));
+  const treatmentLabel = getTreatmentLabel(normalizedTreatment);
+  if (!compatibleMachines.length) {
+    return `${dayLabel}没有符合“${treatmentLabel}、${getMachineZoneLabelForPatient(patient)}”的可用机器。`;
+  }
+
+  const totalSlots = compatibleMachines.length * STAFF_SHIFT_KEYS.length;
+  const openSlots = [];
+  compatibleMachines.forEach((machineId) => {
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      if (!daySchedule?.[machineId]?.[shift]?.patientId) {
+        openSlots.push(`${machineId}号机${SHIFT_LABELS[shift]}`);
+      }
+    });
+  });
+  const occupiedSlots = Math.max(0, totalSlots - openSlots.length);
+  if (!openSlots.length) {
+    return `${dayLabel}共有${compatibleMachines.length}台兼容机器、${totalSlots}个半日位，已经占用${occupiedSlots}个，没有剩余空位。`;
+  }
+  if (patient?.preferredShift) {
+    const preferredOpen = openSlots.filter((slot) => slot.includes(SHIFT_LABELS[patient.preferredShift]));
+    if (!preferredOpen.length) {
+      return `${dayLabel}${SHIFT_LABELS[patient.preferredShift]}没有空位；其他班次还有${openSlots.length}个空位，但系统仍未能满足全部约束。`;
+    }
+  }
+  return `${dayLabel}还有${openSlots.length}个理论空位，但治疗类型、分区、班次或固定机位组合后无法安全放入。`;
+}
+
+function getMachineZoneLabelForPatient(patient) {
+  const infection = normalizeInfectionFlag(patient?.infectionFlag);
+  if (infection) return `${infection}传染区`;
+  return isSeverePatient(patient) ? "重病区/普通区" : "普通区";
+}
+
+function buildWeeklyInsertionForPatient(patient, baseWeeklySchedules = {}, weekNumber = 1) {
+  const schedules = structuredClone(baseWeeklySchedules || {});
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    schedules[dayKey] ||= {};
+  });
+  const plannedDays = getPatientPlannedDays(patient, state.patients.length, SCHEDULE_PRIORITY_PATIENT)
+    .filter((dayKey) => WORKING_DAY_KEYS.includes(dayKey));
+  if (!plannedDays.length) {
+    return { ok: false, messages: [`${patient.name} 没有可用的工作日透析倾向。`] };
+  }
+
+  const hdfCount = normalizeMachineType(patient.treatmentType) === DEFAULT_MACHINE_TYPE
+    ? getTwoWeekHdfCountForWeek(patient, weekNumber, state.patients.length)
+    : 0;
+  const hdfIndexes = getEvenlyDistributedSessionIndexes(plannedDays.length, hdfCount, state.patients.length + weekNumber);
+  const assignedDaysByPatient = new Map();
+  const assignedMachineByPatient = new Map();
+
+  for (const [index, dayKey] of plannedDays.entries()) {
+    const treatmentType = hdfIndexes.has(index) ? "hemofiltration" : normalizeMachineType(patient.treatmentType);
+    const assignment = assignWeeklyPatientSession(
+      { patient, originalDay: dayKey, requestedDay: dayKey, lockedDay: true, treatmentType },
+      schedules,
+      [...getAvailableMachineIds()].sort(sortMachineIds),
+      getSpecialMachines().filter((machineId) => !isMachinePaused(machineId)).sort(sortMachineIds),
+      getAvailableMachineIds().filter((machineId) => getMachineZone(machineId) === MACHINE_ZONE_NORMAL).sort(sortMachineIds),
+      assignedDaysByPatient,
+      assignedMachineByPatient,
+      SCHEDULE_PRIORITY_PATIENT,
+      false,
+    );
+    if (!assignment) {
+      return {
+        ok: false,
+        messages: [`第${weekNumber}周 ${getWeekDayLabel(dayKey)} 没有适合 ${patient.name} 的空位。${explainInsertionNoSlot(patient, dayKey, schedules[dayKey], treatmentType)} 系统不会移动已经排好的患者；请调整新人资料，或由护士长先手动腾出空位。`],
+      };
+    }
+  }
+
+  return { ok: true, schedules };
+}
+
 function savePatientFromForm(event) {
   event.preventDefault();
   const previousPatient = ui.patientId.value ? findPatient(ui.patientId.value) : null;
@@ -1873,6 +4320,7 @@ function savePatientFromForm(event) {
           ? new Date().toISOString()
           : "",
     preferredDays: getCheckedValues(ui.patientPreferredDays),
+    forcePreferredDays: ui.forcePreferredDays.checked,
     note: ui.patientNote.value,
     updatedAt: new Date().toISOString(),
   });
@@ -1953,7 +4401,7 @@ function fillPatientForm(patient) {
   ui.vascularAccess.value = patient.vascularAccess || "";
   ui.patientTreatmentType.value = normalizeMachineType(patient.treatmentType);
   ui.weeklyTreatmentCount.value = patient.weeklyTreatmentCount || 3;
-  ui.monthlyHdfCount.value = patient.monthlyHdfCount ?? 1;
+  ui.monthlyHdfCount.value = patient.monthlyHdfCount ?? 2;
   syncMonthlyHdfAvailability();
   ui.patientStatus.value = patient.status || "active";
   ui.infectionFlag.value = patient.infectionFlag || "";
@@ -1962,6 +4410,7 @@ function fillPatientForm(patient) {
   renderPatientFixedMachineOptions(patient.fixedMachineId || "");
   ui.patientFixedMachine.value = patient.fixedMachineId || "";
   setCheckedValues(ui.patientPreferredDays, patient.preferredDays || []);
+  ui.forcePreferredDays.checked = Boolean(patient.forcePreferredDays);
   ui.patientNote.value = patient.note || "";
   ui.deletePatient.classList.remove("hidden");
 }
@@ -1970,7 +4419,7 @@ function resetPatientForm() {
   ui.patientForm.reset();
   ui.patientId.value = "";
   ui.patientTreatmentType.value = DEFAULT_MACHINE_TYPE;
-  ui.monthlyHdfCount.value = "1";
+  ui.monthlyHdfCount.value = "2";
   syncMonthlyHdfAvailability();
   ui.patientStatus.value = "active";
   ui.infectionFlag.value = "";
@@ -1978,6 +4427,7 @@ function resetPatientForm() {
   renderPatientFixedMachineOptions("");
   ui.patientFixedMachine.value = "";
   setCheckedValues(ui.patientPreferredDays, []);
+  ui.forcePreferredDays.checked = false;
   ui.patientFormTitle.textContent = "新增患者";
   ui.deletePatient.classList.add("hidden");
 }
@@ -2012,6 +4462,12 @@ function deleteSelectedPatient() {
 function removePatientFromSchedules(patientId) {
   removePatientFromScheduleCollection(state.schedules, patientId);
   removePatientFromScheduleCollection(state.weeklySchedules, patientId);
+  ["week1", "week2"].forEach((weekKey) => {
+    removePatientFromScheduleCollection(state.twoWeekCycle?.patientSchedules?.[weekKey], patientId);
+  });
+  if (state.twoWeekCycle) {
+    state.twoWeekCycle.review = null;
+  }
 }
 
 function removePatientFromScheduleCollection(scheduleCollection, patientId) {
@@ -2038,10 +4494,12 @@ function renderPatientTable() {
 
   ui.patientTableBody.innerHTML = patients
     .map((patient) => {
-      const status = patient.status === "paused" ? `<span class="tag off">暂停</span>` : `<span class="tag">在透</span>`;
-      const shift = formatPreference(patient.preferredShift, getPatientPreferredDaysForDisplay(patient));
+      const status = patient.temporaryInsert
+        ? `<span class="tag demo">临时</span>`
+        : patient.status === "paused" ? `<span class="tag off">暂停</span>` : `<span class="tag">在透</span>`;
+      const shift = formatPreference(patient.preferredShift, getPatientPreferredDaysForDisplay(patient), patient.forcePreferredDays);
       const fixedMachine = patient.fixedMachineId ? `固定 ${patient.fixedMachineId}号机` : "待首次排班固定";
-      const plan = `${patient.weeklyTreatmentCount || 3}次/周 · 血滤${patient.monthlyHdfCount ?? 1}次/月`;
+      const plan = `${patient.weeklyTreatmentCount || 3}次/周 · 血滤${patient.monthlyHdfCount ?? 2}次/4周`;
       return `
         <tr>
           <td>
@@ -2224,7 +4682,12 @@ function renderStaffTable() {
 }
 
 function removeStaffFromSchedules(staffId) {
-  [state.weeklyStaffSchedules, state.staffSchedules].forEach((collection) => {
+  const collections = [state.weeklyStaffSchedules, state.staffSchedules];
+  ["week1", "week2"].forEach((weekKey) => {
+    const collection = state.twoWeekCycle?.staffSchedules?.[weekKey];
+    if (collection) collections.push(collection);
+  });
+  collections.forEach((collection) => {
     Object.values(collection || {}).forEach((daySchedule) => {
       STAFF_SHIFT_KEYS.forEach((shift) => {
         const shiftSchedule = daySchedule[shift];
@@ -2239,6 +4702,9 @@ function removeStaffFromSchedules(staffId) {
       });
     });
   });
+  if (state.twoWeekCycle) {
+    state.twoWeekCycle.review = null;
+  }
 }
 
 function generateDemoData() {
@@ -2253,7 +4719,7 @@ function generateDemoData() {
   };
   const infectiousCount = Object.values(infectionCounts).reduce((total, count) => total + count, 0);
   const severeCount = Math.min(patientCount, clampNumber(ui.demoSevereCount.value, 0, 300, 4));
-  const demoMonthlyHdfCount = clampNumber(ui.demoMonthlyHdfCount.value, 0, 4, 1);
+  const demoMonthlyHdfCount = normalizeEvenHdfCount(ui.demoMonthlyHdfCount.value, 2);
   if (!patientCount && !doctorCount && !nurseCount) {
     showToast(getDynamicMessage("enterDemoCount"));
     return;
@@ -2306,6 +4772,7 @@ function createDemoPatient(index, batch, infectionFlags, severeCount, demoMonthl
     careLevel: index < severeCount ? SEVERE_CARE_LEVEL : STANDARD_CARE_LEVEL,
     preferredShift: index % 3 === 0 ? "morning" : index % 3 === 1 ? "afternoon" : "",
     preferredDays: dayPattern,
+    forcePreferredDays: false,
     note: "演示数据",
     demo: true,
     updatedAt: new Date().toISOString(),
@@ -2384,6 +4851,7 @@ function saveLayout(event) {
     inactiveSlots: [],
     pausedMachines: [],
     schedulePriority: normalizeSchedulePriority(state.settings.schedulePriority),
+    staffWorkMode: normalizeStaffWorkMode(state.settings.staffWorkMode),
     specialZoneName: ui.specialZoneName.value.trim().slice(0, 16) || DEFAULT_STATE.settings.specialZoneName,
     machineTypes: {},
     machineZones: {},
@@ -2509,6 +4977,7 @@ function restoreDefaultLayout() {
     roomName: state.settings.roomName || DEFAULT_STATE.settings.roomName,
     language: !isChineseLanguage() ? "en" : "zh",
     schedulePriority: normalizeSchedulePriority(state.settings.schedulePriority),
+    staffWorkMode: normalizeStaffWorkMode(state.settings.staffWorkMode),
     pausedMachines: normalizeMachineIdList(state.settings.pausedMachines, new Set(getMachineIds(DEFAULT_STATE.settings))),
   };
   const compatibilityIssues = getLayoutCompatibilityIssues(nextSettings);
@@ -2547,6 +5016,7 @@ function renderSettingsForm() {
     .join("");
   ui.languageSelect.value = normalizeLanguageCode(state.settings.language);
   ui.schedulePriority.value = normalizeSchedulePriority(state.settings.schedulePriority);
+  ui.staffWorkMode.value = normalizeStaffWorkMode(state.settings.staffWorkMode);
   renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
 }
 
@@ -2554,9 +5024,16 @@ function renderPatientFixedMachineOptions(selectedValue = "") {
   if (!ui.patientFixedMachine) {
     return;
   }
+  renderMachineOptionsForSelect(ui.patientFixedMachine, selectedValue, "首次自动排班后固定");
+}
+
+function renderMachineOptionsForSelect(selectElement, selectedValue = "", emptyLabel = "首次自动排班后固定") {
+  if (!selectElement) {
+    return;
+  }
   const machineIds = [...getMachineIds()].sort(sortMachineIds);
   const hasSelected = selectedValue && machineIds.includes(selectedValue);
-  const options = [`<option value="">首次自动排班后固定</option>`];
+  const options = [`<option value="">${escapeHtml(emptyLabel)}</option>`];
   if (selectedValue && !hasSelected) {
     options.push(`<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}号机（当前布局不存在）</option>`);
   }
@@ -2565,7 +5042,7 @@ function renderPatientFixedMachineOptions(selectedValue = "") {
     const label = `${machineId}号机 · ${getMachineTypeLabel(machineId)} · ${getMachineZoneLabel(machineId)}${pausedLabel}`;
     options.push(`<option value="${escapeHtml(machineId)}"${machineId === selectedValue ? " selected" : ""}>${escapeHtml(label)}</option>`);
   });
-  ui.patientFixedMachine.innerHTML = options.join("");
+  selectElement.innerHTML = options.join("");
 }
 
 function getPatientFixedMachineLabel(patient) {
@@ -2600,13 +5077,9 @@ function renderLanguage() {
   renderStaticTranslations();
   startRuntimeTranslationObserver();
   ui.schedulePriorityLabel.textContent = text.schedulePriority;
-  ui.prevWeek.textContent = text.prevWeek;
-  ui.nextWeek.textContent = text.nextWeek;
-  ui.todayButton.textContent = text.today;
-  ui.autoScheduleDay.textContent = text.autoSchedule;
-  ui.saveDayAsWeeklyTemplate.textContent = text.saveAsWeekly;
-  ui.copyPreviousDay.textContent = text.copyPrevious;
-  ui.clearDay.textContent = text.clearDay;
+  ui.prevWeek.textContent = "本周";
+  ui.nextWeek.textContent = "下周";
+  ui.todayButton.textContent = "回到本周";
   ui.languageSelect.setAttribute("aria-label", text.language);
 }
 
@@ -2620,12 +5093,25 @@ function saveLanguage() {
 function saveSchedulePriority() {
   state.settings.schedulePriority = normalizeSchedulePriority(ui.schedulePriority.value);
   saveState();
+  renderSummary();
+  renderSchedule();
   const messages = {
     [SCHEDULE_PRIORITY_PATIENT]: "已切换为患者优先：尽量保持患者原有星期、班次和固定机位",
     [SCHEDULE_PRIORITY_STAFF]: "已切换为医护优先：患者尽量集中到更少的开班日和班次",
     [SCHEDULE_PRIORITY_SMART]: "已切换为灵巧排班：全部每周3次患者使用安全弹性组合，优先减少单人和低负荷班组",
   };
   showToast(messages[state.settings.schedulePriority]);
+}
+
+function saveStaffWorkMode() {
+  state.settings.staffWorkMode = normalizeStaffWorkMode(ui.staffWorkMode.value);
+  saveState();
+  const messages = {
+    [STAFF_WORK_MODE_BALANCED]: "已切换为均衡轮班：尽量分散上午、下午班次，避免连续整日上班",
+    [STAFF_WORK_MODE_FULL_DAY]: "已切换为整日优先：尽量让同一名护士连续上上午、下午，集中工作日并空出整天休息",
+    [STAFF_WORK_MODE_REST_MAX]: "已切换为休息最大化：优先集中给部分护士整日班，让更多护士获得完整休息日",
+  };
+  showToast(messages[state.settings.staffWorkMode] || messages[STAFF_WORK_MODE_BALANCED]);
 }
 
 function getText() {
@@ -2741,6 +5227,8 @@ function translateRuntimeElement(root = document) {
   return changedCount;
 }
 
+let lastScheduleReview = null;
+let pendingScheduleReviewResolver = null;
 let runtimeTranslationObserver = null;
 let runtimeTranslationFrame = 0;
 const pendingTranslationRoots = new Set();
@@ -3023,7 +5511,7 @@ function saveCurrentWeekAsWeeklyTemplate() {
   showToast(getDynamicMessage("weekSavedAsRecurringTemplate"));
 }
 
-function autoScheduleWeeklyTemplate() {
+async function autoScheduleWeeklyTemplate() {
   const priority = normalizeSchedulePriority(state.settings.schedulePriority);
   const patientResult = buildAutoWeeklyPatientSchedules(getCurrentDate(), priority);
   const staffResult = buildAutoWeeklyStaffSchedules(patientResult.schedules, priority);
@@ -3078,7 +5566,17 @@ function autoScheduleWeeklyTemplate() {
   }
   confirmLines.push("", "确认把这份建议保存为以后长期循环的周模板吗？");
 
-  if (!window.confirm(confirmLines.join("\n"))) {
+  const scheduleReview = buildAutoScheduleReview({
+    patientResult,
+    staffResult,
+    priority,
+    warnings,
+    blocking: [],
+    confirmLines,
+  });
+  lastScheduleReview = scheduleReview;
+  const approved = await showScheduleReviewDialog(scheduleReview, true);
+  if (!approved) {
     return;
   }
 
@@ -3112,9 +5610,609 @@ function autoScheduleWeeklyTemplate() {
   renderSchedule();
   renderSummary();
   showToast(newFixedMachineCount ? `已生成长期周模板，并为 ${newFixedMachineCount} 名患者固定机位` : "已生成长期循环周模板并沿用固定机位");
+  if (lastScheduleReview) {
+    lastScheduleReview.savedAt = new Date().toISOString();
+    lastScheduleReview.status = "saved";
+  }
   if (smartOptimizationSummary) {
     window.alert(formatSmartOptimizationSummary(smartOptimizationSummary));
   }
+}
+
+
+function buildAutoScheduleReview({ patientResult, staffResult, priority, warnings = [], blocking = [], confirmLines = [] }) {
+  const patientRows = buildPatientReviewRows(patientResult.schedules || {});
+  const staffRows = buildStaffReviewRows(staffResult.schedules || {});
+  const positionAdjustments = buildPositionAdjustmentRows(patientRows);
+  const timeAdjustments = (patientResult.timeAdjustments || []).map((item) => ({
+    patientId: item.patientId,
+    patientName: item.name,
+    day: getWeekDayLabel(item.day),
+    from: SHIFT_LABELS[item.from] || item.from,
+    to: SHIFT_LABELS[item.to] || item.to,
+  }));
+  const dayAdjustments = (patientResult.dayAdjustments || []).map((item) => ({
+    patientId: item.patientId,
+    patientName: item.name,
+    from: getWeekDayLabel(item.from),
+    to: getWeekDayLabel(item.to),
+  }));
+  const fixedAssignments = Object.entries(patientResult.fixedMachineAssignments || {}).map(([patientId, machineId]) => ({
+    patientId,
+    patientName: findPatient(patientId)?.name || patientId,
+    machineId,
+    isNew: !findPatient(patientId)?.fixedMachineId,
+  }));
+  const recommendations = buildScheduleReviewRecommendations({
+    patientResult,
+    staffResult,
+    patientRows,
+    staffRows,
+    positionAdjustments,
+    warnings,
+  });
+
+  return {
+    generatedAt: new Date().toISOString(),
+    status: "preview",
+    priority,
+    patientRows,
+    staffRows,
+    dayAdjustments,
+    timeAdjustments,
+    positionAdjustments,
+    fixedAssignments,
+    warnings: [...warnings],
+    blocking: [...blocking],
+    recommendations,
+    stats: {
+      activePatients: patientRows.filter((row) => row.assignmentCount > 0).length,
+      totalTreatments: patientRows.reduce((sum, row) => sum + row.assignmentCount, 0),
+      activeShifts: staffResult.activeShiftCount || 0,
+      doctorPositions: staffResult.doctorShiftCount || 0,
+      nursePositions: staffResult.nurseShiftCount || 0,
+      backupPositions: staffResult.backupShiftCount || 0,
+      dayAdjustmentCount: dayAdjustments.length,
+      timeAdjustmentCount: timeAdjustments.length,
+      positionAdjustmentCount: positionAdjustments.length,
+    },
+    sourceSummary: [...confirmLines],
+  };
+}
+
+function buildPatientReviewRows(weeklySchedules = {}) {
+  const rowMap = new Map(
+    state.patients
+      .filter((patient) => patient.status === "active")
+      .map((patient) => [patient.id, {
+        patientId: patient.id,
+        name: patient.name,
+        dialysisNo: patient.dialysisNo || "",
+        fixedMachineId: patient.fixedMachineId || "",
+        preferredShift: patient.preferredShift || "",
+        preferredDays: [...(patient.preferredDays || [])],
+        days: {},
+        assignmentCount: 0,
+      }]),
+  );
+
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    const daySchedule = weeklySchedules?.[dayKey] || {};
+    Object.entries(daySchedule).forEach(([machineId, machineSchedule]) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        const patientId = machineSchedule?.[shift]?.patientId;
+        if (!patientId) return;
+        const patient = findPatient(patientId);
+        if (!rowMap.has(patientId)) {
+          rowMap.set(patientId, {
+            patientId,
+            name: patient?.name || patientId,
+            dialysisNo: patient?.dialysisNo || "",
+            fixedMachineId: patient?.fixedMachineId || "",
+            preferredShift: patient?.preferredShift || "",
+            preferredDays: [...(patient?.preferredDays || [])],
+            days: {},
+            assignmentCount: 0,
+          });
+        }
+        const row = rowMap.get(patientId);
+        row.days[dayKey] = {
+          shift,
+          machineId,
+          machineType: getMachineTypeLabel(machineId),
+          machineZone: getMachineZoneLabel(machineId),
+        };
+        row.assignmentCount += 1;
+      });
+    });
+  });
+
+  return [...rowMap.values()].sort((left, right) =>
+    String(left.name).localeCompare(String(right.name), "zh-CN")
+  );
+}
+
+function buildStaffReviewRows(weeklyStaffSchedules = {}) {
+  const rowMap = new Map();
+
+  function ensureRow(staffId) {
+    if (!staffId) return null;
+    const staff = findStaff(staffId);
+    if (!rowMap.has(staffId)) {
+      rowMap.set(staffId, {
+        staffId,
+        name: staff?.name || staffId,
+        staffCode: staff?.staffCode || "",
+        role: staff?.role || "",
+        days: {},
+        shiftCount: 0,
+      });
+    }
+    return rowMap.get(staffId);
+  }
+
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    const daySchedule = weeklyStaffSchedules?.[dayKey] || {};
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const shiftSchedule = daySchedule?.[shift] || {};
+      (shiftSchedule.doctors || []).forEach((staffId, index) => {
+        const row = ensureRow(staffId);
+        if (!row) return;
+        if (!row.days[dayKey]) row.days[dayKey] = [];
+        row.days[dayKey].push({ shift, roleLabel: `医生${index + 1}` });
+        row.shiftCount += 1;
+      });
+      const shiftGroups = getNurseGroupsForShift(
+        state.weeklySchedules?.[dayKey] || {},
+        shift,
+        state.settings,
+      ).filter((group) => group && !group.empty);
+
+      (shiftSchedule.nurses || []).forEach((staffId, index) => {
+        const row = ensureRow(staffId);
+        if (!row) return;
+        if (!row.days[dayKey]) row.days[dayKey] = [];
+        const group = shiftGroups[index];
+        row.days[dayKey].push({
+          shift,
+          roleLabel: `责任护士${index + 1}`,
+          zoneLabel: getNurseGroupReviewLabel(group),
+          machineIds: [...(group?.machines || [])],
+        });
+        row.shiftCount += 1;
+      });
+      if (shiftSchedule.backupNurse) {
+        const row = ensureRow(shiftSchedule.backupNurse);
+        if (row) {
+          if (!row.days[dayKey]) row.days[dayKey] = [];
+          row.days[dayKey].push({ shift, roleLabel: "后备护士" });
+          row.shiftCount += 1;
+        }
+      }
+    });
+  });
+
+  return [...rowMap.values()].sort((left, right) =>
+    String(left.name).localeCompare(String(right.name), "zh-CN")
+  );
+}
+
+function getNurseGroupReviewLabel(group) {
+  if (!group || group.empty) {
+    return "未分配管区";
+  }
+  const machines = [...(group.machines || [])]
+    .map((machineId) => Number(machineId))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const machineText = machines.length
+    ? machines.length === 1
+      ? `${machines[0]}号机`
+      : `${machines[0]}—${machines[machines.length - 1]}号机`
+    : "未标明机位";
+  const zoneText = group.zoneLabel || group.zone || "普通区";
+  return `${zoneText} · ${machineText}`;
+}
+
+function buildPositionAdjustmentRows(patientRows = []) {
+  const adjustments = [];
+  patientRows.forEach((row) => {
+    if (!row.fixedMachineId) return;
+    Object.entries(row.days || {}).forEach(([dayKey, assignment]) => {
+      if (String(assignment.machineId) !== String(row.fixedMachineId)) {
+        adjustments.push({
+          patientId: row.patientId,
+          patientName: row.name,
+          day: getWeekDayLabel(dayKey),
+          shift: SHIFT_LABELS[assignment.shift] || assignment.shift,
+          fromMachineId: row.fixedMachineId,
+          toMachineId: assignment.machineId,
+        });
+      }
+    });
+  });
+  return adjustments;
+}
+
+function buildScheduleReviewRecommendations({
+  patientResult,
+  staffResult,
+  patientRows,
+  staffRows,
+  positionAdjustments,
+  warnings,
+}) {
+  const recommendations = [];
+
+  if ((patientResult.dayAdjustments || []).length) {
+    recommendations.push({
+      level: "warning",
+      title: "透析日期发生调整",
+      detail: `共有 ${new Set(patientResult.dayAdjustments.map((item) => item.patientId)).size} 名患者、${patientResult.dayAdjustments.length} 次治疗被调到其他日期，必须逐人确认患者是否能够到院。`,
+    });
+  }
+
+  if ((patientResult.timeAdjustments || []).length) {
+    recommendations.push({
+      level: "warning",
+      title: "上午/下午班次发生调整",
+      detail: `共有 ${patientResult.timeAdjustments.length} 次班次变化，建议逐人电话或现场确认。`,
+    });
+  }
+
+  if (positionAdjustments.length) {
+    recommendations.push({
+      level: "warning",
+      title: "固定机位发生临时变化",
+      detail: `发现 ${positionAdjustments.length} 次患者机位与长期固定机位不同，执行前应确认换位原因并通知患者与责任护士。`,
+    });
+  }
+
+  const sameDayZoneChanges = [];
+  staffRows.forEach((row) => {
+    WORKING_DAY_KEYS.forEach((dayKey) => {
+      const entries = row.days?.[dayKey] || [];
+      const morning = entries.find((entry) => entry.shift === "morning" && entry.zoneLabel);
+      const afternoon = entries.find((entry) => entry.shift === "afternoon" && entry.zoneLabel);
+      if (morning && afternoon && morning.zoneLabel !== afternoon.zoneLabel) {
+        sameDayZoneChanges.push({
+          staffName: row.name,
+          day: getWeekDayLabel(dayKey),
+          morning: morning.zoneLabel,
+          afternoon: afternoon.zoneLabel,
+        });
+      }
+    });
+  });
+  if (sameDayZoneChanges.length) {
+    recommendations.push({
+      level: "advice",
+      title: "同日上下班负责区域发生变化",
+      detail: `发现 ${sameDayZoneChanges.length} 次同一护士上午、下午负责不同区域。系统已尽量保持同区连续，但受护士组数量变化或安全规则限制，建议人工复核。`,
+    });
+  }
+
+  const shiftCounts = staffRows.map((row) => row.shiftCount).filter((count) => count > 0);
+  if (shiftCounts.length) {
+    const min = Math.min(...shiftCounts);
+    const max = Math.max(...shiftCounts);
+    if (max - min >= 2) {
+      const heavy = staffRows.filter((row) => row.shiftCount === max).map((row) => row.name).join("、");
+      const light = staffRows.filter((row) => row.shiftCount === min).map((row) => row.name).join("、");
+      recommendations.push({
+        level: "advice",
+        title: "医护班次数量存在差异",
+        detail: `最多 ${max} 个班次：${heavy}；最少 ${min} 个班次：${light}。建议人工检查是否需要轮换。`,
+      });
+    }
+  }
+
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    const daySchedule = patientResult.schedules?.[dayKey] || {};
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const groups = getNurseGroupsForShift(daySchedule, shift, state.settings)
+        .filter((group) => group && !group.empty);
+      groups.forEach((group) => {
+        if (group.patientCount <= 2) {
+          const machineRows = [...new Set(
+            (group.machines || [])
+              .map((machineId) => getMachinePositionMap(state.settings).get(String(machineId))?.row)
+              .filter(Number.isInteger),
+          )];
+          recommendations.push({
+            level: group.patientCount === 1 ? "warning" : "advice",
+            title: "低负荷护士管区",
+            detail: `${getWeekDayLabel(dayKey)}${SHIFT_LABELS[shift]}，第 ${machineRows.length ? machineRows[0] + 1 : "?"} 排，${group.patientCount} 人/护士。若医学与患者条件允许，可人工评估是否调整日期或班次。`,
+          });
+        }
+      });
+    });
+  });
+
+  (warnings || []).forEach((warning) => recommendations.push({
+    level: "warning",
+    title: "系统警告",
+    detail: warning,
+  }));
+
+  if (!recommendations.length) {
+    recommendations.push({
+      level: "ok",
+      title: "未发现明显需要调整的项目",
+      detail: "仍需由科室负责人、责任护士和院感人员逐项核对后执行。",
+    });
+  }
+
+  return recommendations;
+}
+
+function openCurrentScheduleReview() {
+  const patientSchedules = WORKING_DAY_KEYS.reduce((result, dayKey) => {
+    result[dayKey] = structuredClone(state.weeklySchedules?.[dayKey] || {});
+    return result;
+  }, {});
+  const staffSchedules = WORKING_DAY_KEYS.reduce((result, dayKey) => {
+    result[dayKey] = structuredClone(state.weeklyStaffSchedules?.[dayKey] || createEmptyStaffScheduleDay(0));
+    return result;
+  }, {});
+
+  const patientResult = {
+    schedules: patientSchedules,
+    dayAdjustments: [],
+    timeAdjustments: [],
+    fixedMachineAssignments: {},
+  };
+  const staffResult = {
+    schedules: staffSchedules,
+    activeShiftCount: countActiveStaffShifts(staffSchedules),
+    doctorShiftCount: countStaffPositions(staffSchedules, "doctor"),
+    nurseShiftCount: countStaffPositions(staffSchedules, "nurse"),
+    backupShiftCount: countStaffPositions(staffSchedules, "backup"),
+  };
+  lastScheduleReview = buildAutoScheduleReview({
+    patientResult,
+    staffResult,
+    priority: normalizeSchedulePriority(state.settings.schedulePriority),
+    warnings: [],
+    blocking: [],
+    confirmLines: [],
+  });
+  showScheduleReviewDialog(lastScheduleReview, false);
+}
+
+function countActiveStaffShifts(weeklyStaffSchedules = {}) {
+  let count = 0;
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const entry = weeklyStaffSchedules?.[dayKey]?.[shift];
+      if (entry && ((entry.doctors || []).some(Boolean) || (entry.nurses || []).some(Boolean) || entry.backupNurse)) {
+        count += 1;
+      }
+    });
+  });
+  return count;
+}
+
+function countStaffPositions(weeklyStaffSchedules = {}, type = "nurse") {
+  let count = 0;
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const entry = weeklyStaffSchedules?.[dayKey]?.[shift] || {};
+      if (type === "doctor") count += (entry.doctors || []).filter(Boolean).length;
+      if (type === "nurse") count += (entry.nurses || []).filter(Boolean).length;
+      if (type === "backup") count += entry.backupNurse ? 1 : 0;
+    });
+  });
+  return count;
+}
+
+function showScheduleReviewDialog(review, confirmMode = false) {
+  lastScheduleReview = review;
+  ui.confirmScheduleReview.hidden = !confirmMode;
+  ui.scheduleReviewMeta.textContent = [
+    `生成时间：${new Date(review.generatedAt).toLocaleString()}`,
+    `策略：${getSchedulePriorityLabel(review.priority)}`,
+    `护士上班方式：${getStaffWorkModeLabel()}`,
+    review.status === "saved" ? "状态：已保存" : "状态：待人工复核",
+  ].join(" · ");
+  ui.scheduleReviewContent.innerHTML = renderScheduleReview(review);
+  ui.scheduleReviewDialog.showModal();
+
+  if (!confirmMode) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    pendingScheduleReviewResolver = resolve;
+  });
+}
+
+function closeScheduleReview(approved = false) {
+  if (ui.scheduleReviewDialog.open) {
+    ui.scheduleReviewDialog.close();
+  }
+  const resolver = pendingScheduleReviewResolver;
+  pendingScheduleReviewResolver = null;
+  if (resolver) resolver(Boolean(approved));
+}
+
+function getSchedulePriorityLabel(priority = state?.settings?.schedulePriority) {
+  const normalizedPriority = normalizeSchedulePriority(priority);
+  return normalizedPriority === SCHEDULE_PRIORITY_SMART
+    ? "灵巧排班"
+    : normalizedPriority === SCHEDULE_PRIORITY_STAFF
+      ? "医护优先"
+      : "患者优先";
+}
+
+function renderScheduleReview(review) {
+  const statCards = [
+    ["在排患者", `${review.stats.activePatients} 人`],
+    ["本周治疗", `${review.stats.totalTreatments} 次`],
+    ["实际开班", `${review.stats.activeShifts} 个`],
+    ["责任护士岗位", `${review.stats.nursePositions} 个`],
+    ["日期调整", `${review.stats.dayAdjustmentCount} 次`],
+    ["班次调整", `${review.stats.timeAdjustmentCount} 次`],
+    ["位置调整", `${review.stats.positionAdjustmentCount} 次`],
+  ].map(([label, value]) => `
+    <article class="review-stat-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </article>
+  `).join("");
+
+  return `
+    <section class="review-section">
+      <h3>一、总体概览</h3>
+      <div class="review-stat-grid">${statCards}</div>
+    </section>
+
+    <section class="review-section">
+      <h3>二、必须人工确认的变化</h3>
+      ${renderReviewChanges(review)}
+    </section>
+
+    <section class="review-section">
+      <h3>三、全体患者每周班次表</h3>
+      <div class="review-table-wrap">${renderPatientReviewTable(review.patientRows)}</div>
+    </section>
+
+    <section class="review-section">
+      <h3>四、全体医护每周班次表</h3>
+      <div class="review-table-wrap">${renderStaffReviewTable(review.staffRows)}</div>
+    </section>
+
+    <section class="review-section">
+      <h3>五、系统建议与警告</h3>
+      ${renderReviewRecommendations(review.recommendations)}
+    </section>
+  `;
+}
+
+function renderReviewChanges(review) {
+  const blocks = [];
+
+  if (review.dayAdjustments.length) {
+    blocks.push(`
+      <div class="review-change-block warning">
+        <h4>透析日期调整（${review.dayAdjustments.length}）</h4>
+        <ul>${review.dayAdjustments.map((item) =>
+          `<li><strong>${escapeHtml(item.patientName)}</strong>：${escapeHtml(item.from)} → ${escapeHtml(item.to)}</li>`
+        ).join("")}</ul>
+      </div>
+    `);
+  }
+
+  if (review.timeAdjustments.length) {
+    blocks.push(`
+      <div class="review-change-block warning">
+        <h4>上午/下午调整（${review.timeAdjustments.length}）</h4>
+        <ul>${review.timeAdjustments.map((item) =>
+          `<li><strong>${escapeHtml(item.patientName)}</strong>（${escapeHtml(item.day)}）：${escapeHtml(item.from)} → ${escapeHtml(item.to)}</li>`
+        ).join("")}</ul>
+      </div>
+    `);
+  }
+
+  if (review.positionAdjustments.length) {
+    blocks.push(`
+      <div class="review-change-block warning">
+        <h4>机位调整（${review.positionAdjustments.length}）</h4>
+        <ul>${review.positionAdjustments.map((item) =>
+          `<li><strong>${escapeHtml(item.patientName)}</strong>（${escapeHtml(item.day)} ${escapeHtml(item.shift)}）：${escapeHtml(item.fromMachineId)}号机 → ${escapeHtml(item.toMachineId)}号机</li>`
+        ).join("")}</ul>
+      </div>
+    `);
+  }
+
+  const newFixed = review.fixedAssignments.filter((item) => item.isNew);
+  if (newFixed.length) {
+    blocks.push(`
+      <div class="review-change-block info">
+        <h4>首次固定机位（${newFixed.length}）</h4>
+        <ul>${newFixed.map((item) =>
+          `<li><strong>${escapeHtml(item.patientName)}</strong>：固定到 ${escapeHtml(item.machineId)} 号机</li>`
+        ).join("")}</ul>
+      </div>
+    `);
+  }
+
+  return blocks.length ? blocks.join("") : `<div class="review-empty">本次未记录日期、班次或固定机位变化。</div>`;
+}
+
+function renderPatientReviewTable(rows = []) {
+  const headers = WORKING_DAY_KEYS.map((dayKey) => `<th>${escapeHtml(getWeekDayLabel(dayKey))}</th>`).join("");
+  const body = rows.map((row) => `
+    <tr>
+      <td class="review-name-cell"><strong>${escapeHtml(row.name)}</strong><small>${escapeHtml(row.dialysisNo || "")}</small></td>
+      <td>${escapeHtml(row.fixedMachineId ? `${row.fixedMachineId}号机` : "未固定")}</td>
+      ${WORKING_DAY_KEYS.map((dayKey) => {
+        const entry = row.days?.[dayKey];
+        return `<td>${entry
+          ? `<span class="review-assignment">${escapeHtml(SHIFT_LABELS[entry.shift])}<br>${escapeHtml(entry.machineId)}号机</span>`
+          : `<span class="review-none">—</span>`}</td>`;
+      }).join("")}
+    </tr>
+  `).join("");
+  return `
+    <table class="review-table">
+      <thead><tr><th>患者</th><th>固定机位</th>${headers}</tr></thead>
+      <tbody>${body || `<tr><td colspan="${WORKING_DAY_KEYS.length + 2}">暂无患者排班</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+function renderStaffReviewTable(rows = []) {
+  const headers = WORKING_DAY_KEYS.map((dayKey) => `<th>${escapeHtml(getWeekDayLabel(dayKey))}</th>`).join("");
+  const body = rows.map((row) => `
+    <tr>
+      <td class="review-name-cell"><strong>${escapeHtml(row.name)}</strong><small>${escapeHtml(row.staffCode || "")}</small></td>
+      <td>${escapeHtml(row.role === "doctor" ? "医生" : "护士")}</td>
+      <td>${escapeHtml(`${row.shiftCount}个班次`)}</td>
+      ${WORKING_DAY_KEYS.map((dayKey) => {
+        const entries = row.days?.[dayKey] || [];
+        return `<td>${entries.length
+          ? entries.map((entry) => {
+              if (entry.zoneLabel) {
+                return `<span class="review-staff-duty">
+                  <strong>${escapeHtml(SHIFT_LABELS[entry.shift])}</strong>
+                  <span>负责：${escapeHtml(entry.zoneLabel)}</span>
+                </span>`;
+              }
+              return `<span class="review-staff-duty">
+                <strong>${escapeHtml(SHIFT_LABELS[entry.shift])}</strong>
+                <span>${escapeHtml(entry.roleLabel)}</span>
+              </span>`;
+            }).join("<br>")
+          : `<span class="review-none">休</span>`}</td>`;
+      }).join("")}
+    </tr>
+  `).join("");
+  return `
+    <table class="review-table">
+      <thead><tr><th>医护</th><th>角色</th><th>总班次</th>${headers}</tr></thead>
+      <tbody>${body || `<tr><td colspan="${WORKING_DAY_KEYS.length + 3}">暂无医护排班</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+function renderReviewRecommendations(items = []) {
+  return `
+    <div class="review-recommendation-list">
+      ${items.map((item) => `
+        <article class="review-recommendation ${escapeHtml(item.level || "advice")}">
+          <strong>${escapeHtml(item.title)}</strong>
+          <p>${escapeHtml(item.detail)}</p>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function printScheduleReview() {
+  if (!lastScheduleReview) return;
+  document.body.classList.add("printing-schedule-review");
+  window.print();
+  setTimeout(() => document.body.classList.remove("printing-schedule-review"), 300);
 }
 
 function buildSmartOptimizationSummary(smartPatientResult, smartStaffResult) {
@@ -3212,7 +6310,7 @@ function formatSmartOptimizationSummary(summary) {
   return lines.join("\n");
 }
 
-function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priority = state.settings.schedulePriority) {
+function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priority = state.settings.schedulePriority, options = {}) {
   const allMachines = [...getMachineIds()].sort(sortMachineIds);
   const machines = [...getAvailableMachineIds()].sort(sortMachineIds);
   const specialMachines = getSpecialMachines().filter((machineId) => !isMachinePaused(machineId)).sort(sortMachineIds);
@@ -3229,8 +6327,21 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
   const sessions = [];
   const fixedMachineAssignments = {};
   const assignedMachineByPatient = new Map();
-  const activePatients = state.patients.filter((patient) => patient.status === "active");
-  const missingDayPreference = activePatients.filter((patient) => !patient.preferredDays?.length);
+  Object.entries(options.preferredMachineAssignments || {}).forEach(([patientIdOrKey, machineId]) => {
+    if (!machineId) return;
+    const assignmentKey = patientIdOrKey.includes(":")
+      ? patientIdOrKey
+      : getPatientMachineAssignmentKey(patientIdOrKey, DEFAULT_MACHINE_TYPE);
+    assignedMachineByPatient.set(assignmentKey, String(machineId));
+  });
+  const sessionTreatmentResolver = typeof options.sessionTreatmentResolver === "function"
+    ? options.sessionTreatmentResolver
+    : null;
+  const skipMonthlyHdfOverrides = Boolean(options.skipMonthlyHdfOverrides);
+  blocking.push(...validateForcedPreferredDaysPatients());
+  ensureDefaultDialysisDaysForSchedulablePatients(priority);
+  const activePatients = getSchedulablePatients();
+  const missingDayPreference = [];
   const insufficientDayPreference = activePatients.filter(
     (patient) => patient.preferredDays?.length && patient.preferredDays.length < clampNumber(patient.weeklyTreatmentCount, 1, 6, 3),
   );
@@ -3250,30 +6361,40 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
     if (isMachinePaused(patient.fixedMachineId)) {
       warnings.push(`${patient.name} 的固定机位 ${patient.fixedMachineId} 已暂停，本次自动排班会临时安排到其他兼容机器；恢复后可重新生成并回到原机位。`);
     } else {
-      assignedMachineByPatient.set(patient.id, patient.fixedMachineId);
+      assignedMachineByPatient.set(getPatientMachineAssignmentKey(patient.id, patient.treatmentType), patient.fixedMachineId);
     }
   });
+
+  if (blocking.length) {
+    return { schedules, monthlyHdfOverrides, warnings, blocking, timeAdjustments, dayAdjustments, fixedMachineAssignments, monthlyHdfCount: 0, assignedCount: 0 };
+  }
 
   const flexibleDemand = new Map();
   let flexiblePatternPatientCount = 0;
   activePatients.forEach((patient, patientIndex) => {
     const requestedDays = getPatientPlannedDays(patient, patientIndex, SCHEDULE_PRIORITY_PATIENT);
     const frequency = clampNumber(patient.weeklyTreatmentCount, 1, 6, 3);
-    const plannedDays = isFlexibleDayPriority(priority) && frequency === 3
+    const canOptimizeDays = isFlexibleDayPriority(priority) && frequency === 3 && !hasForcedPreferredDays(patient);
+    const plannedDays = canOptimizeDays
       ? chooseOptimizedThriceWeeklyPattern(patient, flexibleDemand, patientIndex)
       : getPatientPlannedDays(patient, patientIndex, priority);
-    if (isFlexibleDayPriority(priority) && frequency === 3) {
+    if (canOptimizeDays) {
       registerFlexiblePatternDemand(patient, plannedDays, flexibleDemand);
       if (!sameDayPattern(plannedDays, requestedDays)) {
         flexiblePatternPatientCount += 1;
       }
     }
     plannedDays.forEach((dayKey, index) => {
+      const defaultTreatmentType = normalizeMachineType(patient.treatmentType);
+      const resolvedTreatmentType = sessionTreatmentResolver
+        ? sessionTreatmentResolver({ patient, patientIndex, index, dayKey, plannedDays, requestedDays, defaultTreatmentType })
+        : defaultTreatmentType;
       sessions.push({
         patient,
         originalDay: dayKey,
         requestedDay: requestedDays[index] || dayKey,
-        treatmentType: normalizeMachineType(patient.treatmentType),
+        lockedDay: hasForcedPreferredDays(patient),
+        treatmentType: normalizeMachineType(resolvedTreatmentType || defaultTreatmentType),
       });
     });
   });
@@ -3282,10 +6403,16 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
     warnings.push(`${modeLabel}已将 ${flexiblePatternPatientCount} 名每周3次患者在安全组合 1-3-5、2-4-6、1-3-6、1-4-6 中优化透析日期，以减少单人或低负荷护士组。`);
   }
   sessions.sort((a, b) => sortAutoPatients(a.patient, b.patient) || getDaySortValue(a.originalDay) - getDaySortValue(b.originalDay));
+  if (options.preassignMachines) {
+    const preassigned = buildSessionMachineAssignments(sessions, assignedMachineByPatient);
+    preassigned.forEach((machineId, assignmentKey) => {
+      assignedMachineByPatient.set(assignmentKey, machineId);
+    });
+  }
   const infectiousDue = sessions.filter((session) => isInfectiousPatient(session.patient));
 
   if (!sessions.length) {
-    blocking.push("当前没有可生成周模板的在透患者。请先在患者库设置透析星期倾向。");
+    blocking.push("当前没有可生成周模板的可排班患者。请确认患者库中至少有1名未暂停患者；星期未设置时系统会自动分配，不需要手动填写。");
   }
   if (missingDayPreference.length) {
     warnings.push(`${missingDayPreference.length} 名在透患者未设置透析星期倾向，系统已按治疗计划均衡安排。`);
@@ -3298,15 +6425,21 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
   }
   blocking.push(...getWeeklyCapacityProblems(sessions, specialMachines, regularMachines));
   if (blocking.length) {
+    if (shouldFallbackToPatientPriority(priority, options)) {
+      return buildPatientPriorityFallbackSchedule(selectedDate, priority, options, warnings, blocking.join("；"));
+    }
     return { schedules, monthlyHdfOverrides, warnings, blocking, timeAdjustments, dayAdjustments, fixedMachineAssignments, monthlyHdfCount: 0, assignedCount: 0 };
   }
 
   const unassigned = [];
   const assignedDaysByPatient = new Map();
   sessions.forEach((session) => {
-    const assignment = assignWeeklyPatientSession(session, schedules, machines, specialMachines, regularMachines, assignedDaysByPatient, assignedMachineByPatient, priority);
+    const assignment = assignWeeklyPatientSession(session, schedules, machines, specialMachines, regularMachines, assignedDaysByPatient, assignedMachineByPatient, priority, Boolean(options.fastMachineSelection));
     if (!assignment) {
-      unassigned.push(`${session.patient.name}（原${getWeekDayLabel(session.originalDay)}）`);
+      unassigned.push({
+        label: `${session.patient.name}（${session.lockedDay ? "强制" : "原"}${getWeekDayLabel(session.originalDay)}）`,
+        lockedDay: Boolean(session.lockedDay),
+      });
       return;
     }
     const patientDays = assignedDaysByPatient.get(session.patient.id) || new Set();
@@ -3321,10 +6454,17 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
   });
 
   if (unassigned.length) {
-    blocking.push(`周模板仍有治疗次数未能安排：${unassigned.join("、")}。请检查机器类型、特殊区数量和患者倾向。`);
+    const forcedHint = unassigned.some((item) => item.lockedDay)
+      ? "强制个性化患者不会自动改到其他星期；如果当天容量不足，请增加当天可用机位，或取消该患者的强制个性化后重新生成。"
+      : "";
+    const reason = `周模板仍有治疗次数未能安排：${unassigned.map((item) => item.label).join("、")}。${forcedHint}系统已尝试固定机位、推荐机位和全部兼容机位；请检查该患者分区、治疗类型、血滤机数量、暂停机器和同日治疗间隔。`;
+    if (shouldFallbackToPatientPriority(priority, options)) {
+      return buildPatientPriorityFallbackSchedule(selectedDate, priority, options, warnings, reason);
+    }
+    blocking.push(reason);
   }
 
-  if (!blocking.length) {
+  if (!blocking.length && !skipMonthlyHdfOverrides) {
     const hdfResult = buildMonthlyHdfOverrides(selectedDate, schedules, specialMachines, regularMachines);
     Object.assign(monthlyHdfOverrides, hdfResult.overrides);
     warnings.push(...hdfResult.warnings);
@@ -3332,7 +6472,7 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
   }
 
   activePatients.forEach((patient) => {
-    const machineId = assignedMachineByPatient.get(patient.id);
+    const machineId = assignedMachineByPatient.get(getPatientMachineAssignmentKey(patient.id, patient.treatmentType));
     if (machineId && !patient.fixedMachineId) {
       fixedMachineAssignments[patient.id] = machineId;
     }
@@ -3351,13 +6491,218 @@ function buildAutoWeeklyPatientSchedules(selectedDate = getCurrentDate(), priori
   };
 }
 
+function shouldFallbackToPatientPriority(priority, options = {}) {
+  return isFlexibleDayPriority(priority) && !options.disableFlexibleFallback;
+}
+
+function buildPatientPriorityFallbackSchedule(selectedDate, priority, options = {}, currentWarnings = [], reason = "") {
+  const modeLabel = priority === SCHEDULE_PRIORITY_SMART ? "灵巧排班" : "医护优先";
+  let triedStaffPriorityFirst = false;
+  if (priority === SCHEDULE_PRIORITY_SMART) {
+    const staffFallback = buildAutoWeeklyPatientSchedules(selectedDate, SCHEDULE_PRIORITY_STAFF, {
+      ...options,
+      disableFlexibleFallback: true,
+    });
+    if (!staffFallback.blocking?.length) {
+      staffFallback.warnings = dedupeMessages([
+        `${modeLabel}集中排班在当前患者数量、血滤、传染/非传染分区和严重组约束下无法完整生成，已优先改用医护优先排班法。${reason ? `原因为：${reason}` : ""}`,
+        ...(currentWarnings || []),
+        ...(staffFallback.warnings || []),
+      ]);
+      return staffFallback;
+    }
+    triedStaffPriorityFirst = true;
+  }
+  const fallback = buildAutoWeeklyPatientSchedules(selectedDate, SCHEDULE_PRIORITY_PATIENT, {
+    ...options,
+    disableFlexibleFallback: true,
+  });
+  const fallbackMessage = triedStaffPriorityFirst
+    ? `${modeLabel}集中排班在当前患者数量、血滤、传染/非传染分区和严重组约束下无法完整生成；系统已先尝试医护优先排班法，但医护优先仍放不下，最后改用患者优先安全排班：先按患者设置的星期几倾向安排，放不下才调整到其他工作日。${reason ? `原因为：${reason}` : ""}`
+    : `${modeLabel}集中排班在当前患者数量、血滤、传染/非传染分区和严重组约束下无法完整生成，已自动改用患者优先安全排班：先按患者设置的星期几倾向安排，放不下才调整到其他工作日。${reason ? `原因为：${reason}` : ""}`;
+  fallback.warnings = dedupeMessages([
+    fallbackMessage,
+    ...(currentWarnings || []),
+    ...(fallback.warnings || []),
+  ]);
+  return fallback;
+}
+
+function buildMonthlyHdfOverrides(selectedDate, weeklySchedules = {}, specialMachines = [], regularMachines = []) {
+  const overrides = {};
+  const warnings = [];
+  const blocking = [];
+  const hdfMachineByPatient = new Map();
+  const weekStart = getWeekStart(parseDateInput(selectedDate));
+  const activePatients = getSchedulablePatients()
+    .filter((patient) => normalizeMachineType(patient.treatmentType) === DEFAULT_MACHINE_TYPE)
+    .filter((patient) => normalizeEvenHdfCount(patient.monthlyHdfCount, 0) > 0);
+
+  activePatients.forEach((patient, patientIndex) => {
+    const sessions = getFourWeekPatientSessions(patient.id, weeklySchedules, weekStart);
+    const targetCount = Math.min(normalizeEvenHdfCount(patient.monthlyHdfCount, 0), sessions.length);
+    if (!targetCount) {
+      warnings.push(`${patient.name} 未找到可转换为月度血滤的常规血透排班。`);
+      return;
+    }
+
+    const selectedIndexes = getEvenlyDistributedSessionIndexes(sessions.length, targetCount, patientIndex);
+    selectedIndexes.forEach((sessionIndex) => {
+      const session = sessions[sessionIndex];
+      const result = addMonthlyHdfOverrideForSession({
+        patient,
+        session,
+        weeklySchedules,
+        overrides,
+        specialMachines,
+        regularMachines,
+        hdfMachineByPatient,
+      });
+      if (result.blocking) blocking.push(result.blocking);
+      if (result.warning) warnings.push(result.warning);
+    });
+  });
+
+  return { overrides, warnings: dedupeMessages(warnings), blocking: dedupeMessages(blocking) };
+}
+
+function getFourWeekPatientSessions(patientId, weeklySchedules, weekStart) {
+  const sessions = [];
+  for (let weekOffset = 0; weekOffset < 4; weekOffset += 1) {
+    WORKING_DAY_KEYS.forEach((dayKey, dayIndex) => {
+      const date = formatDateInput(addDays(weekStart, weekOffset * 7 + dayIndex));
+      const daySchedule = weeklySchedules?.[dayKey] || {};
+      Object.entries(daySchedule).forEach(([machineId, machine]) => {
+        STAFF_SHIFT_KEYS.forEach((shift) => {
+          const slot = machine?.[shift];
+          if (slot?.patientId === patientId && normalizeMachineType(slot.treatmentType) === DEFAULT_MACHINE_TYPE) {
+            sessions.push({ date, dayKey, machineId, shift, slot });
+          }
+        });
+      });
+    });
+  }
+  return sessions;
+}
+
+function addMonthlyHdfOverrideForSession({ patient, session, weeklySchedules, overrides, specialMachines, regularMachines, hdfMachineByPatient }) {
+  const weeklyDay = weeklySchedules?.[session.dayKey] || {};
+  const overrideDay = overrides[session.date] || {};
+  const effectiveDay = removePatientSessionFromDay(
+    mergeScheduleDays(weeklyDay, overrideDay),
+    patient.id,
+    session.machineId,
+    session.shift,
+  );
+  const preferredHdfMachineId = hdfMachineByPatient?.get(patient.id) || "";
+  const targetMachineId = findMonthlyHdfMachine(patient, session, effectiveDay, specialMachines, regularMachines, preferredHdfMachineId);
+  if (!targetMachineId) {
+    return {
+      blocking: `${patient.name} 在 ${formatDateLabel(session.date)} ${SHIFT_LABELS[session.shift]} 未找到可用血滤机，请检查血滤机数量、分区和暂停机器。`,
+    };
+  }
+  if (hdfMachineByPatient && !hdfMachineByPatient.has(patient.id)) {
+    hdfMachineByPatient.set(patient.id, String(targetMachineId));
+  }
+
+  const now = new Date().toISOString();
+  const note = `每月血滤；原${session.machineId}号机${SHIFT_LABELS[session.shift]}`;
+  if (String(targetMachineId) !== String(session.machineId)) {
+    setScheduleSlot(overrides, session.date, session.machineId, session.shift, {
+      removed: true,
+      source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
+      note,
+      updatedAt: now,
+    });
+  }
+  setScheduleSlot(overrides, session.date, targetMachineId, session.shift, {
+    patientId: patient.id,
+    treatmentType: "hemofiltration",
+    source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
+    note,
+    updatedAt: now,
+  });
+  return {};
+}
+
+function removePatientSessionFromDay(daySchedule, patientId, machineId, shift) {
+  const result = structuredClone(daySchedule || {});
+  if (result?.[machineId]?.[shift]?.patientId === patientId) {
+    delete result[machineId][shift];
+    if (!result[machineId].morning && !result[machineId].afternoon) {
+      delete result[machineId];
+    }
+  }
+  return result;
+}
+
+function findMonthlyHdfMachine(patient, session, effectiveDay, specialMachines = [], regularMachines = [], preferredHdfMachineId = "") {
+  const preferredMachineId = preferredHdfMachineId ? String(preferredHdfMachineId) : "";
+  const pool = getEligibleMachinePoolForTreatment(patient, "hemofiltration", specialMachines, regularMachines)
+    .filter((machineId) => machineSupportsTreatment(machineId, "hemofiltration"))
+    .sort((left, right) =>
+      Number(Boolean(preferredMachineId) && String(left) !== preferredMachineId) - Number(Boolean(preferredMachineId) && String(right) !== preferredMachineId) ||
+      Number(String(left) !== String(session.machineId)) - Number(String(right) !== String(session.machineId)) ||
+      getMachineZonePreferenceScore(patient, left) - getMachineZonePreferenceScore(patient, right) ||
+      sortMachineIds(left, right),
+    );
+  return pool.find((machineId) => {
+    if (effectiveDay?.[machineId]?.[session.shift]?.patientId) {
+      return false;
+    }
+    return candidateKeepsNurseGroupsValid(machineId, session.shift, effectiveDay, patient, "hemofiltration");
+  }) || "";
+}
+
+function countMonthlyHdfOverrides(overrides = {}) {
+  let count = 0;
+  Object.values(overrides || {}).forEach((daySchedule) => {
+    Object.values(daySchedule || {}).forEach((machine) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        const slot = machine?.[shift];
+        if (
+          slot?.patientId &&
+          normalizeMachineType(slot.treatmentType) === "hemofiltration" &&
+          normalizeScheduleSlotSource(slot.source, slot.note) === AUTO_OVERRIDE_SOURCE_MONTHLY_HDF
+        ) {
+          count += 1;
+        }
+      });
+    });
+  });
+  return count;
+}
+
+function clearGeneratedMonthlyHdfOverrides() {
+  Object.keys(state.schedules || {}).forEach((date) => {
+    const daySchedule = state.schedules[date];
+    Object.keys(daySchedule || {}).forEach((machineId) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        const slot = daySchedule?.[machineId]?.[shift];
+        if (slot && normalizeScheduleSlotSource(slot.source, slot.note) === AUTO_OVERRIDE_SOURCE_MONTHLY_HDF) {
+          delete daySchedule[machineId][shift];
+        }
+      });
+      if (!daySchedule[machineId]?.morning && !daySchedule[machineId]?.afternoon) {
+        delete daySchedule[machineId];
+      }
+    });
+    if (!Object.keys(daySchedule || {}).length) {
+      delete state.schedules[date];
+    }
+  });
+}
+
 function getPatientPlannedDays(patient, patientIndex = 0, priority = SCHEDULE_PRIORITY_PATIENT) {
   const frequency = clampNumber(patient.weeklyTreatmentCount, 1, 6, 3);
+  const selected = normalizeDayPreference(patient.preferredDays);
+  if (hasForcedPreferredDays(patient)) {
+    return [...selected];
+  }
   if (isCompactResourcePriority(priority)) {
     return getStaffPriorityDayPattern(frequency);
   }
 
-  const selected = normalizeDayPreference(patient.preferredDays);
   const planned = [];
   selected.forEach((dayKey) => {
     if (planned.length < frequency && !planned.includes(dayKey)) {
@@ -3385,6 +6730,63 @@ function getStaffPriorityDayPattern(frequency) {
     6: ["1", "2", "3", "4", "5", "6"],
   };
   return [...(patterns[frequency] || patterns[3])];
+}
+
+function getDaySortValue(dayKey) {
+  const index = WORKING_DAY_KEYS.indexOf(String(dayKey));
+  return index >= 0 ? index : WORKING_DAY_KEYS.length;
+}
+
+function sortAutoPatients(a, b) {
+  return Number(isInfectiousPatient(b)) - Number(isInfectiousPatient(a)) ||
+    Number(isSeverePatient(b)) - Number(isSeverePatient(a)) ||
+    Number(Boolean(b.fixedMachineId)) - Number(Boolean(a.fixedMachineId)) ||
+    normalizeMachineType(b.treatmentType).localeCompare(normalizeMachineType(a.treatmentType)) ||
+    clampNumber(b.weeklyTreatmentCount, 1, 6, 3) - clampNumber(a.weeklyTreatmentCount, 1, 6, 3) ||
+    sortPatients(a, b);
+}
+
+function getDayTreatmentLoad(schedules, dayKey, machines = getMachineIds()) {
+  const day = schedules?.[dayKey] || {};
+  return STAFF_SHIFT_KEYS.reduce((sum, shift) => sum + countAssigned(day, machines, shift), 0);
+}
+
+function getWorkingDaysForStaffPriority(schedules, machines = getMachineIds()) {
+  return [...WORKING_DAY_KEYS].sort((left, right) => {
+    const leftLoad = getDayTreatmentLoad(schedules, left, machines);
+    const rightLoad = getDayTreatmentLoad(schedules, right, machines);
+    return Number(leftLoad === 0) - Number(rightLoad === 0) ||
+      rightLoad - leftLoad ||
+      getDaySortValue(left) - getDaySortValue(right);
+  });
+}
+
+function getWorkingDaysByCurrentLoad(schedules, machines = getMachineIds()) {
+  return [...WORKING_DAY_KEYS].sort((left, right) =>
+    getDayTreatmentLoad(schedules, left, machines) - getDayTreatmentLoad(schedules, right, machines) ||
+    getDaySortValue(left) - getDaySortValue(right),
+  );
+}
+
+function getShiftTreatmentLoad(daySchedule, machines = getMachineIds(), shift) {
+  return countAssigned(daySchedule || {}, machines, shift);
+}
+
+function getShiftsForStaffPriority(daySchedule, machines = getMachineIds()) {
+  return [...STAFF_SHIFT_KEYS].sort((left, right) => {
+    const leftLoad = getShiftTreatmentLoad(daySchedule, machines, left);
+    const rightLoad = getShiftTreatmentLoad(daySchedule, machines, right);
+    return Number(leftLoad === 0) - Number(rightLoad === 0) ||
+      rightLoad - leftLoad ||
+      STAFF_SHIFT_KEYS.indexOf(left) - STAFF_SHIFT_KEYS.indexOf(right);
+  });
+}
+
+function getShiftsByCurrentLoad(daySchedule, machines = getMachineIds()) {
+  return [...STAFF_SHIFT_KEYS].sort((left, right) =>
+    getShiftTreatmentLoad(daySchedule, machines, left) - getShiftTreatmentLoad(daySchedule, machines, right) ||
+    STAFF_SHIFT_KEYS.indexOf(left) - STAFF_SHIFT_KEYS.indexOf(right),
+  );
 }
 
 function chooseOptimizedThriceWeeklyPattern(patient, demandMap, patientIndex = 0) {
@@ -3519,796 +6921,236 @@ function getCapacityGroups(sessions) {
   ];
 }
 
-function assignWeeklyPatientSession(session, schedules, machines, specialMachines, regularMachines, assignedDaysByPatient, assignedMachineByPatient, priority = SCHEDULE_PRIORITY_PATIENT) {
+function buildSessionMachineAssignments(sessions, existingAssignments = new Map()) {
+  const groups = new Map();
+  sessions.forEach((session) => {
+    const key = getPatientMachineAssignmentKey(session.patient.id, session.treatmentType);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        patient: session.patient,
+        treatmentType: session.treatmentType,
+        days: [],
+      });
+    }
+    groups.get(key).days.push(session.originalDay);
+  });
+
+  const dayLoads = new Map();
+  const totalLoads = new Map();
+  getAvailableMachineIds().forEach((machineId) => {
+    dayLoads.set(machineId, new Map(WORKING_DAY_KEYS.map((dayKey) => [dayKey, 0])));
+    totalLoads.set(machineId, 0);
+  });
+
+  const result = new Map();
+  const orderedGroups = [...groups.values()].sort((left, right) => {
+    const leftFixed = Number(
+      normalizeMachineType(left.treatmentType) === normalizeMachineType(left.patient.treatmentType) &&
+      Boolean(left.patient.fixedMachineId),
+    );
+    const rightFixed = Number(
+      normalizeMachineType(right.treatmentType) === normalizeMachineType(right.patient.treatmentType) &&
+      Boolean(right.patient.fixedMachineId),
+    );
+    return rightFixed - leftFixed ||
+      Number(isInfectiousPatient(right.patient)) - Number(isInfectiousPatient(left.patient)) ||
+      right.days.length - left.days.length ||
+      sortAutoPatients(left.patient, right.patient);
+  });
+
+  const reserve = (machineId, group) => {
+    result.set(group.key, machineId);
+    totalLoads.set(machineId, (totalLoads.get(machineId) || 0) + group.days.length);
+    const loads = dayLoads.get(machineId);
+    group.days.forEach((dayKey) => loads.set(dayKey, (loads.get(dayKey) || 0) + 1));
+  };
+
+  orderedGroups.forEach((group) => {
+    const compatible = getAvailableMachineIds()
+      .filter((machineId) => !isMachinePaused(machineId))
+      .filter((machineId) => patientFitsMachineForTreatment(group.patient, group.treatmentType, machineId));
+    if (!compatible.length) return;
+
+    const preferred = existingAssignments.get(group.key);
+    const fixed =
+      normalizeMachineType(group.treatmentType) === normalizeMachineType(group.patient.treatmentType) &&
+      group.patient.fixedMachineId &&
+      compatible.includes(group.patient.fixedMachineId)
+        ? group.patient.fixedMachineId
+        : "";
+    const candidates = [...new Set([fixed, preferred, ...compatible].filter(Boolean))];
+    const scored = candidates.map((machineId) => {
+      const loads = dayLoads.get(machineId);
+      const dayOverflow = group.days.reduce(
+        (total, dayKey) => total + Math.max(0, (loads.get(dayKey) || 0) + 1 - STAFF_SHIFT_KEYS.length),
+        0,
+      );
+      const totalOverflow = Math.max(
+        0,
+        (totalLoads.get(machineId) || 0) + group.days.length - WORKING_DAY_KEYS.length * STAFF_SHIFT_KEYS.length,
+      );
+      const dayLoadScore = group.days.reduce((total, dayKey) => total + (loads.get(dayKey) || 0), 0);
+      return {
+        machineId,
+        fixedPenalty: fixed && machineId !== fixed ? 1 : 0,
+        preferredPenalty: preferred && machineId !== preferred ? 1 : 0,
+        overflow: dayOverflow * 100 + totalOverflow * 1000,
+        dayLoadScore,
+        totalLoad: totalLoads.get(machineId) || 0,
+      };
+    }).sort((left, right) =>
+      left.fixedPenalty - right.fixedPenalty ||
+      left.preferredPenalty - right.preferredPenalty ||
+      left.overflow - right.overflow ||
+      left.dayLoadScore - right.dayLoadScore ||
+      left.totalLoad - right.totalLoad ||
+      sortMachineIds(left.machineId, right.machineId),
+    );
+    if (scored.length) reserve(scored[0].machineId, group);
+  });
+
+  return result;
+}
+
+function getPatientMachineAssignmentKey(patientId, treatmentType) {
+  return `${String(patientId)}:${normalizeMachineType(treatmentType)}`;
+}
+
+function assignWeeklyPatientSession(session, schedules, machines, specialMachines, regularMachines, assignedDaysByPatient, assignedMachineByPatient, priority = SCHEDULE_PRIORITY_PATIENT, fastMachineSelection = false) {
   const patient = session.patient;
   const eligiblePool = getEligibleMachinePoolForTreatment(patient, session.treatmentType, specialMachines, regularMachines)
     .filter((machineId) => !isMachinePaused(machineId));
-  const fixedMachineAvailable = patient.fixedMachineId && !isMachinePaused(patient.fixedMachineId);
-  const fixedMachineId = fixedMachineAvailable ? patient.fixedMachineId : assignedMachineByPatient.get(patient.id) || "";
-  const pool = fixedMachineId ? eligiblePool.filter((machineId) => machineId === fixedMachineId) : eligiblePool;
-  if (fixedMachineId && !pool.length) {
+  const assignmentKey = getPatientMachineAssignmentKey(patient.id, session.treatmentType);
+  const preferredMachineId = assignedMachineByPatient.get(assignmentKey) || "";
+  const fixedMachineAvailable =
+    normalizeMachineType(session.treatmentType) === normalizeMachineType(patient.treatmentType) &&
+    patient.fixedMachineId &&
+    !isMachinePaused(patient.fixedMachineId) &&
+    eligiblePool.includes(patient.fixedMachineId);
+  const fixedMachineId = fixedMachineAvailable ? patient.fixedMachineId : "";
+
+  if (!eligiblePool.length) {
     return null;
   }
+
   const alreadyAssignedDays = assignedDaysByPatient.get(patient.id) || new Set();
-  const primaryDays = WORKING_DAY_KEYS.includes(session.originalDay) && !alreadyAssignedDays.has(session.originalDay) ? [session.originalDay] : [];
-  const fallbackDays = (isCompactResourcePriority(priority)
+  const primaryDays =
+    WORKING_DAY_KEYS.includes(session.originalDay) && !alreadyAssignedDays.has(session.originalDay)
+      ? [session.originalDay]
+      : [];
+  const fallbackDays = session.lockedDay ? [] : (isCompactResourcePriority(priority)
     ? getWorkingDaysForStaffPriority(schedules, machines)
     : getWorkingDaysByCurrentLoad(schedules, machines))
     .filter((dayKey) => !primaryDays.includes(dayKey) && !alreadyAssignedDays.has(dayKey));
   const dayChoices = [...primaryDays, ...fallbackDays];
 
-  for (const dayKey of dayChoices) {
-    const shiftChoices = isCompactResourcePriority(priority)
-      ? getShiftsForStaffPriority(schedules[dayKey], machines)
-      : patient.preferredShift
-        ? [patient.preferredShift, ...STAFF_SHIFT_KEYS.filter((shift) => shift !== patient.preferredShift)]
+  const shiftChoicesForDay = (dayKey, relaxed = false) => {
+    if (relaxed || !patient.preferredShift) {
+      return isCompactResourcePriority(priority)
+        ? getShiftsForStaffPriority(schedules[dayKey], machines)
         : getShiftsByCurrentLoad(schedules[dayKey], machines);
-    for (const shift of shiftChoices) {
-      const machineId = findBestMachineForPatient(patient, pool, shift, schedules[dayKey], priority);
-      if (machineId) {
-        const notes = [];
-        if (dayKey !== session.requestedDay) {
-          notes.push(`原倾向日期：${getWeekDayLabel(session.requestedDay)}`);
-        }
-        if (patient.preferredShift && shift !== patient.preferredShift) {
-          notes.push(`原倾向：${SHIFT_LABELS[patient.preferredShift]}`);
-        }
-        if (patient.fixedMachineId && isMachinePaused(patient.fixedMachineId)) {
-          notes.push(`固定${patient.fixedMachineId}号机暂停`);
-        }
-        if (!assignedMachineByPatient.get(patient.id)) {
-          assignedMachineByPatient.set(patient.id, machineId);
-        }
-        setScheduleSlot({ weekly: schedules[dayKey] }, "weekly", machineId, shift, {
-          patientId: patient.id,
-          treatmentType: session.treatmentType,
-          note: notes.join("；"),
-          updatedAt: new Date().toISOString(),
-        });
-        return { day: dayKey, shift, machineId };
-      }
     }
-  }
-
-  return null;
-}
-
-function buildMonthlyHdfOverrides(selectedDate, weeklySchedules, specialMachines, regularMachines) {
-  const overrides = {};
-  const warnings = [];
-  const blocking = [];
-  const monthDates = getWorkingDatesInMonthlyCycle(parseDateInput(selectedDate));
-  const activePatients = state.patients.filter((patient) => patient.status === "active" && clampNumber(patient.monthlyHdfCount, 0, 4, 1) > 0);
-
-  activePatients.forEach((patient, patientIndex) => {
-    const monthlyCount = clampNumber(patient.monthlyHdfCount, 0, 4, 1);
-    const eligibleHdfPool = getEligibleMachinePoolForTreatment(patient, "hemofiltration", specialMachines, regularMachines);
-    const hdfPool = patient.fixedMachineId && eligibleHdfPool.includes(patient.fixedMachineId)
-      ? [patient.fixedMachineId, ...eligibleHdfPool.filter((machineId) => machineId !== patient.fixedMachineId)]
-      : eligibleHdfPool;
-    if (!hdfPool.length) {
-      blocking.push(`${patient.name} 需要每月血滤，但没有匹配的血滤机器（${getRequiredPatientZoneLabel(patient)}）。`);
-      return;
-    }
-
-    const weeklyLocations = getWeeklyLocationsForPatient(weeklySchedules, patient.id);
-    if (!weeklyLocations.length) {
-      blocking.push(`${patient.name} 没有可替换为血滤的常规周模板位置。`);
-      return;
-    }
-
-    const usedDates = new Set();
-    for (let index = 0; index < monthlyCount; index += 1) {
-      const assignment = assignMonthlyHdfSession(patient, patientIndex + index, weeklyLocations, monthDates, weeklySchedules, overrides, hdfPool, usedDates);
-      if (!assignment) {
-        blocking.push(`${patient.name} 第 ${index + 1} 次月血滤未能安排。`);
-      }
-    }
-  });
-
-  if (Object.keys(overrides).length) {
-    warnings.push(`已为未来 4 周月度周期生成 ${countMonthlyHdfOverrides(overrides)} 次血滤日期调整；这些调整不会进入每周重复模板。`);
-  }
-
-  return { overrides, warnings, blocking };
-}
-
-function assignMonthlyHdfSession(patient, rotateBy, weeklyLocations, monthDates, weeklySchedules, overrides, hdfPool, usedDates) {
-  const candidates = getMonthlyHdfCandidates(weeklyLocations, monthDates, rotateBy)
-    .filter((candidate) => !usedDates.has(candidate.date));
-
-  for (const candidate of candidates) {
-    const override = overrides[candidate.date] || {};
-    const weeklyDay = weeklySchedules[candidate.location.day] || {};
-    const effectiveDay = mergeScheduleDays(weeklyDay, override);
-    const shiftChoices = [candidate.location.shift, ...STAFF_SHIFT_KEYS.filter((shift) => shift !== candidate.location.shift)];
-    for (const shift of shiftChoices) {
-      const sortedHdfPool = sortHdfCandidates(hdfPool, shift, effectiveDay, patient);
-      const preferredMachineId = candidate.location.machineId;
-      const machineChoices = hdfPool.includes(preferredMachineId)
-        ? [preferredMachineId, ...sortedHdfPool.filter((machineId) => machineId !== preferredMachineId)]
-        : sortedHdfPool;
-      for (const machineId of machineChoices) {
-        const hdfSlot = effectiveDay[machineId]?.[shift];
-        const hdfAssignment = createMonthlyHdfOverrideForSlot(patient, candidate, machineId, shift, hdfSlot, override);
-        if (hdfAssignment) {
-          overrides[candidate.date] = override;
-          usedDates.add(candidate.date);
-          return hdfAssignment;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function sortHdfCandidates(machinePool, shift, daySchedule, patient = null) {
-  const machines = [...machinePool];
-  if (!patient) {
-    return machines.sort((a, b) => {
-      const occupiedDiff = Number(Boolean(daySchedule[a]?.[shift]?.patientId)) - Number(Boolean(daySchedule[b]?.[shift]?.patientId));
-      return occupiedDiff || sortMachineIds(a, b);
-    });
-  }
-
-  return machines.sort((a, b) => {
-    const occupiedDiff = Number(Boolean(daySchedule[a]?.[shift]?.patientId)) - Number(Boolean(daySchedule[b]?.[shift]?.patientId));
-    const proximityDiff = getMachineProximityScore(daySchedule, shift, a) - getMachineProximityScore(daySchedule, shift, b);
-    return occupiedDiff || proximityDiff || sortMachineIds(a, b);
-  });
-}
-
-function getCurrentNurseGroupMetrics(daySchedule, shift) {
-  const groups = getNurseGroupsForShift(daySchedule, shift).filter((group) => !group.empty);
-  return {
-    groupCount: groups.length,
-    compactness: groups.reduce((total, group) => total + getNurseSegmentCompactness(group.machines), 0),
+    return [patient.preferredShift, ...STAFF_SHIFT_KEYS.filter((shift) => shift !== patient.preferredShift)];
   };
-}
 
-function createMonthlyHdfOverrideForSlot(patient, candidate, machineId, shift, hdfSlot, override) {
-  const originalMachineId = candidate.location.machineId;
-  const originalShift = candidate.location.shift;
-  const note = `每月血滤；原${getWeekDayLabel(candidate.location.day)}${SHIFT_LABELS[originalShift]}`;
+  const buildPoolAttempts = () => {
+    const attempts = [];
 
-  if (!hdfSlot?.patientId || hdfSlot.patientId === patient.id) {
-    if (machineId !== originalMachineId || shift !== originalShift) {
-      setScheduleSlot({ monthly: override }, "monthly", originalMachineId, originalShift, {
-        removed: true,
-        source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
-        updatedAt: new Date().toISOString(),
+    // 第1层：原规则。固定机位或前一周推荐机位优先。
+    if (fixedMachineId) {
+      attempts.push({
+        label: "固定机位",
+        pool: [fixedMachineId],
+        relaxed: false,
+      });
+    } else if (preferredMachineId && eligiblePool.includes(preferredMachineId)) {
+      attempts.push({
+        label: "推荐机位",
+        pool: [preferredMachineId, ...eligiblePool.filter((machineId) => machineId !== preferredMachineId)],
+        relaxed: false,
+      });
+    } else {
+      attempts.push({
+        label: "常规机位",
+        pool: [...eligiblePool],
+        relaxed: false,
       });
     }
-    setScheduleSlot({ monthly: override }, "monthly", machineId, shift, {
-      patientId: patient.id,
-      treatmentType: "hemofiltration",
-      note,
-      source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
-      updatedAt: new Date().toISOString(),
-    });
-    return { date: candidate.date, machineId, shift };
-  }
 
-  const displacedPatient = findPatient(hdfSlot.patientId);
-  const displacedTreatmentType = normalizeMachineType(hdfSlot.treatmentType || displacedPatient?.treatmentType);
-  if (!displacedPatient || !patientFitsMachineForTreatment(displacedPatient, displacedTreatmentType, originalMachineId)) {
-    return null;
-  }
-
-  setScheduleSlot({ monthly: override }, "monthly", originalMachineId, originalShift, {
-    patientId: displacedPatient.id,
-    treatmentType: displacedTreatmentType,
-    note: `与${patient.name}月血滤对调`,
-    source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
-    updatedAt: new Date().toISOString(),
-  });
-  setScheduleSlot({ monthly: override }, "monthly", machineId, shift, {
-    patientId: patient.id,
-    treatmentType: "hemofiltration",
-    note,
-    source: AUTO_OVERRIDE_SOURCE_MONTHLY_HDF,
-    updatedAt: new Date().toISOString(),
-  });
-  return { date: candidate.date, machineId, shift };
-}
-
-function getMonthlyHdfCandidates(weeklyLocations, monthDates, rotateBy) {
-  const candidates = [];
-  weeklyLocations.forEach((location) => {
-    monthDates
-      .filter((dateValue) => getWeekdayKey(dateValue) === location.day)
-      .forEach((date) => candidates.push({ date, location }));
-  });
-  if (!candidates.length) {
-    return [];
-  }
-  const offset = rotateBy % candidates.length;
-  return [...candidates.slice(offset), ...candidates.slice(0, offset)];
-}
-
-function getWeeklyLocationsForPatient(weeklySchedules, patientId) {
-  const locations = [];
-  WORKING_DAY_KEYS.forEach((dayKey) => {
-    Object.entries(weeklySchedules[dayKey] || {}).forEach(([machineId, item]) => {
-      STAFF_SHIFT_KEYS.forEach((shift) => {
-        if (item?.[shift]?.patientId === patientId) {
-          locations.push({ day: dayKey, machineId, shift });
-        }
+    // 第2层：如果固定/推荐机位导致个别患者卡住，放宽到全部兼容机位。
+    // 这一步只在本次自动排班中临时换机，不会自动覆盖患者资料中的长期固定机位。
+    const fullPool = [...eligiblePool];
+    const firstPool = attempts[0]?.pool || [];
+    const samePool = firstPool.length === fullPool.length &&
+      firstPool.every((machineId, index) => String(machineId) === String(fullPool[index]));
+    if (!samePool) {
+      attempts.push({
+        label: "全部兼容机位",
+        pool: fullPool,
+        relaxed: true,
       });
-    });
-  });
-  return locations;
-}
-
-function getWorkingDatesInMonthlyCycle(date) {
-  const start = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const end = addDays(start, 27);
-  const dates = [];
-  for (let cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
-    const value = formatDateInput(cursor);
-    if (WORKING_DAY_KEYS.includes(getWeekdayKey(value))) {
-      dates.push(value);
     }
-  }
-  return dates;
-}
 
-function isGeneratedMonthlyHdfSlot(slot) {
-  return Boolean(slot && normalizeScheduleSlotSource(slot.source, slot.note) === AUTO_OVERRIDE_SOURCE_MONTHLY_HDF);
-}
-
-function clearGeneratedMonthlyHdfOverrides() {
-  Object.entries(state.schedules || {}).forEach(([date, daySchedule]) => {
-    const generatedPatients = new Set();
-    Object.values(daySchedule || {}).forEach((item) => {
-      STAFF_SHIFT_KEYS.forEach((shift) => {
-        const slot = item?.[shift];
-        if (isGeneratedMonthlyHdfSlot(slot) && slot.patientId) {
-          generatedPatients.add(String(slot.patientId));
-        }
-      });
+    // 第3层：最后按机器当前负载重新排序，减少“先到先占”导致的局部死锁。
+    attempts.push({
+      label: "低负载兼容机位",
+      pool: fullPool.sort((left, right) => getMachineWeeklyLoad(schedules, left) - getMachineWeeklyLoad(schedules, right) || sortMachineIds(left, right)),
+      relaxed: true,
     });
 
-    Object.entries(daySchedule || {}).forEach(([machineId, item]) => {
-      STAFF_SHIFT_KEYS.forEach((shift) => {
-        if (isGeneratedMonthlyHdfSlot(item?.[shift])) {
-          delete item[shift];
-        }
-      });
-      pruneEmptySchedule(state.schedules, date, machineId);
-    });
+    return attempts;
+  };
 
-    if (!generatedPatients.size || !state.schedules[date]) {
-      return;
-    }
-    const weekdayKey = getWeekdayKey(date);
-    generatedPatients.forEach((patientId) => {
-      getWeeklyLocationsForPatient(state.weeklySchedules, patientId)
-        .filter((location) => location.day === weekdayKey)
-        .forEach((location) => {
-          const slot = state.schedules[date]?.[location.machineId]?.[location.shift];
-          if (slot?.removed && !slot.note) {
-            delete state.schedules[date][location.machineId][location.shift];
-            pruneEmptySchedule(state.schedules, date, location.machineId);
+  for (const attempt of buildPoolAttempts()) {
+    for (const dayKey of dayChoices) {
+      const shiftChoices = shiftChoicesForDay(dayKey, attempt.relaxed);
+      for (const shift of shiftChoices) {
+        const machineId = findBestMachineForPatient(patient, attempt.pool, shift, schedules[dayKey], priority, fastMachineSelection, session.treatmentType);
+        if (machineId) {
+          const notes = [];
+          if (dayKey !== session.requestedDay) {
+            notes.push(`原倾向日期：${getWeekDayLabel(session.requestedDay)}`);
           }
-        });
-    });
-  });
+          if (patient.preferredShift && shift !== patient.preferredShift) {
+            notes.push(`原倾向：${SHIFT_LABELS[patient.preferredShift]}`);
+          }
+          if (patient.fixedMachineId && isMachinePaused(patient.fixedMachineId)) {
+            notes.push(`固定${patient.fixedMachineId}号机暂停`);
+          }
+          if (attempt.relaxed && patient.fixedMachineId && String(machineId) !== String(patient.fixedMachineId)) {
+            notes.push(`固定机位已临时调整`);
+          }
+          if (attempt.relaxed && preferredMachineId && String(machineId) !== String(preferredMachineId)) {
+            notes.push(`为完成排班临时换机`);
+          }
+          if (
+            !assignedMachineByPatient.get(assignmentKey) ||
+            (!fixedMachineId && attempt.relaxed && preferredMachineId && String(machineId) !== String(preferredMachineId))
+          ) {
+            assignedMachineByPatient.set(assignmentKey, machineId);
+          }
+          setScheduleSlot({ weekly: schedules[dayKey] }, "weekly", machineId, shift, {
+            patientId: patient.id,
+            treatmentType: session.treatmentType,
+            note: notes.join("；"),
+            updatedAt: new Date().toISOString(),
+          });
+          return { day: dayKey, shift, machineId, relaxed: attempt.relaxed, attempt: attempt.label };
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
-function countMonthlyHdfOverrides(overrides) {
-  return Object.values(overrides || {}).reduce((count, daySchedule) => {
-    return (
-      count +
-      Object.values(daySchedule || {}).reduce((dayCount, item) => {
-        return dayCount + STAFF_SHIFT_KEYS.filter((shift) => item?.[shift]?.treatmentType === "hemofiltration" && item?.[shift]?.patientId).length;
-      }, 0)
-    );
+function getMachineWeeklyLoad(schedules, machineId) {
+  return WORKING_DAY_KEYS.reduce((sum, dayKey) => {
+    const day = schedules?.[dayKey] || {};
+    const machine = day?.[machineId] || {};
+    return sum + STAFF_SHIFT_KEYS.filter((shift) => machine?.[shift]?.patientId).length;
   }, 0);
-}
-
-function getWorkingDaysByCurrentLoad(schedules, machines) {
-  return [...WORKING_DAY_KEYS].sort((left, right) => {
-    const leftLoad = countAssigned(schedules[left] || {}, machines, "morning") + countAssigned(schedules[left] || {}, machines, "afternoon");
-    const rightLoad = countAssigned(schedules[right] || {}, machines, "morning") + countAssigned(schedules[right] || {}, machines, "afternoon");
-    const loadDiff = leftLoad + getDaySchedulingPenalty(left) - (rightLoad + getDaySchedulingPenalty(right));
-    return loadDiff || getDaySortValue(left) - getDaySortValue(right);
-  });
-}
-
-function getWorkingDaysForStaffPriority(schedules, machines) {
-  return [...WORKING_DAY_KEYS].sort((left, right) => {
-    const leftLoad = countAssigned(schedules[left] || {}, machines, "morning") + countAssigned(schedules[left] || {}, machines, "afternoon");
-    const rightLoad = countAssigned(schedules[right] || {}, machines, "morning") + countAssigned(schedules[right] || {}, machines, "afternoon");
-    const activeDiff = Number(rightLoad > 0) - Number(leftLoad > 0);
-    return activeDiff || rightLoad - leftLoad || getDaySortValue(left) - getDaySortValue(right);
-  });
-}
-
-function getShiftsForStaffPriority(schedule, machines) {
-  const daySchedule = getScheduleDay(schedule);
-  const preferredOrder = getStaffPreferredShiftOrder();
-  return [...STAFF_SHIFT_KEYS].sort((left, right) => {
-    const leftLoad = countAssigned(daySchedule, machines, left);
-    const rightLoad = countAssigned(daySchedule, machines, right);
-    const activeDiff = Number(rightLoad > 0) - Number(leftLoad > 0);
-    const preferredDiff = preferredOrder.indexOf(left) - preferredOrder.indexOf(right);
-    return activeDiff || rightLoad - leftLoad || preferredDiff;
-  });
-}
-
-function getStaffPreferredShiftOrder() {
-  const activeStaff = state.staffMembers.filter((staff) => staff.status === "active");
-  const scores = STAFF_SHIFT_KEYS.reduce((result, shift) => {
-    result[shift] = activeStaff.reduce((score, staff) => score + scoreShiftPreference(staff, shift), 0);
-    return result;
-  }, {});
-  return [...STAFF_SHIFT_KEYS].sort((left, right) => scores[right] - scores[left] || STAFF_SHIFT_KEYS.indexOf(left) - STAFF_SHIFT_KEYS.indexOf(right));
-}
-
-function getDaySortValue(dayKey) {
-  const index = WORKING_DAY_KEYS.indexOf(String(dayKey));
-  return index >= 0 ? index : WORKING_DAY_KEYS.length;
-}
-
-function getDaySchedulingPenalty(dayKey) {
-  if (String(dayKey) === "5") {
-    return 1;
-  }
-  if (String(dayKey) === "6") {
-    return 2;
-  }
-  return 0;
-}
-
-function buildAutoWeeklyStaffSchedules(weeklySchedules = state.weeklySchedules, priority = state.settings.schedulePriority) {
-  const schedules = {};
-  const warnings = [];
-  const blocking = [];
-  const doctors = state.staffMembers.filter((staff) => staff.role === "doctor" && staff.status === "active");
-  const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
-  const maxRequiredNursesInActiveShift = Math.max(
-    0,
-    ...WORKING_DAY_KEYS.flatMap((dayKey) => STAFF_SHIFT_KEYS.map((shift) => getRequiredNurseCountForShift(weeklySchedules[dayKey] || {}, shift))),
-  );
-  const hasActiveShift = maxRequiredNursesInActiveShift > 0;
-  const minimumNursesPerActiveShift = maxRequiredNursesInActiveShift + BACKUP_NURSE_COUNT;
-
-  if (hasActiveShift && doctors.length < DOCTOR_COUNT) {
-    blocking.push(`在岗医生不足：每个开班班次需要 ${DOCTOR_COUNT} 名，当前只有 ${doctors.length} 名。`);
-  }
-  if (hasActiveShift && nurses.length < minimumNursesPerActiveShift) {
-    blocking.push(`在岗护士不足：最大开班班次需要 ${minimumNursesPerActiveShift} 名（含后备），当前只有 ${nurses.length} 名。`);
-  }
-  if (blocking.length) {
-    return { schedules, warnings, blocking, nurseShiftCount: 0, doctorShiftCount: 0, backupShiftCount: 0, activeShiftCount: 0 };
-  }
-
-  const assignmentCounts = new Map([...doctors, ...nurses].map((staff) => [staff.id, 0]));
-  let nurseShiftCount = 0;
-  let doctorShiftCount = 0;
-  let backupShiftCount = 0;
-  let activeShiftCount = 0;
-  WORKING_DAY_KEYS.forEach((dayKey) => {
-    const daySchedule = weeklySchedules[dayKey] || {};
-    const nurseCounts = STAFF_SHIFT_KEYS.map((shift) => getRequiredNurseCountForShift(daySchedule, shift));
-    const dayNurseSlotCount = Math.max(1, ...nurseCounts);
-    const schedule = createEmptyStaffScheduleDay(dayNurseSlotCount);
-    const usedToday = new Set();
-    STAFF_SHIFT_KEYS.forEach((shift) => {
-      const patientCount = countAssigned(daySchedule, getMachineIds(), shift);
-      const nurseCount = getRequiredNurseCountForShift(daySchedule, shift);
-      if (!patientCount || !nurseCount) {
-        return;
-      }
-      activeShiftCount += 1;
-      doctorShiftCount += DOCTOR_COUNT;
-      nurseShiftCount += nurseCount;
-      backupShiftCount += BACKUP_NURSE_COUNT;
-
-      const selectedDoctors = chooseStaffForShiftBalanced(doctors, DOCTOR_COUNT, shift, usedToday, assignmentCounts);
-      selectedDoctors.forEach((staff) => markStaffAssigned(staff.id, usedToday, assignmentCounts));
-      schedule[shift].doctors = selectedDoctors.map((staff) => staff.id);
-
-      const selectedNurses = chooseStaffForShiftBalanced(nurses, nurseCount, shift, usedToday, assignmentCounts);
-      selectedNurses.forEach((staff) => markStaffAssigned(staff.id, usedToday, assignmentCounts));
-      schedule[shift].nurses = Array.from({ length: dayNurseSlotCount }, (_, index) => selectedNurses[index]?.id || "");
-
-      const usedThisShift = new Set([...schedule[shift].doctors, ...schedule[shift].nurses]);
-      const backup = chooseStaffForShiftBalanced(
-        nurses.filter((staff) => !usedThisShift.has(staff.id)),
-        BACKUP_NURSE_COUNT,
-        shift,
-        usedToday,
-        assignmentCounts,
-      )[0];
-      if (backup) {
-        schedule[shift].backupNurse = backup.id;
-        markStaffAssigned(backup.id, usedToday, assignmentCounts);
-      }
-    });
-
-    const repeatedStaff = getRepeatedStaffInDay(schedule);
-    if (repeatedStaff.length) {
-      warnings.push(`${getWeekDayLabel(dayKey)} 为保证岗位数量，以下医护存在跨班安排：${repeatedStaff.map(getStaffDisplayName).join("、")}。`);
-    }
-    schedules[dayKey] = schedule;
-  });
-
-  if (isCompactResourcePriority(priority)) {
-    warnings.push(`${priority === SCHEDULE_PRIORITY_SMART ? "灵巧排班" : "医护优先"}已将患者尽量集中到 ${activeShiftCount} 个开班班次，其余空班次不安排医护。`);
-  }
-  return { schedules, warnings, blocking, nurseShiftCount, doctorShiftCount, backupShiftCount, activeShiftCount };
-}
-
-function getRequiredNurseCountForShift(daySchedule, shift, settings = state.settings) {
-  const patientCount = countAssigned(daySchedule || {}, getMachineIds(settings), shift);
-  if (!patientCount) {
-    return 0;
-  }
-  return getNurseGroupsForShift(daySchedule, shift, settings).filter((group) => !group.empty).length;
-}
-
-function getRequiredNurseCountForWeeklySchedules(weeklySchedules = state.weeklySchedules) {
-  return Math.max(1, ...WORKING_DAY_KEYS.map((dayKey) => getRequiredNurseCountForDay(weeklySchedules[dayKey] || {})));
-}
-
-function chooseStaffForShiftBalanced(staffList, count, shift, usedToday, assignmentCounts) {
-  const compare = (a, b) =>
-    scoreShiftPreference(b, shift) - scoreShiftPreference(a, shift) ||
-    (assignmentCounts.get(a.id) || 0) - (assignmentCounts.get(b.id) || 0) ||
-    sortStaffMembers(a, b);
-  const preferred = staffList.filter((staff) => !usedToday.has(staff.id)).sort(compare);
-  const fallback = staffList.filter((staff) => usedToday.has(staff.id)).sort(compare);
-  return [...preferred, ...fallback].slice(0, count);
-}
-
-function markStaffAssigned(staffId, usedToday, assignmentCounts) {
-  usedToday.add(staffId);
-  assignmentCounts.set(staffId, (assignmentCounts.get(staffId) || 0) + 1);
-}
-
-function buildAutoStaffSchedule(date) {
-  const nurseCount = getRequiredNurseCountForDate(date);
-  const schedule = createEmptyStaffScheduleDay(nurseCount);
-  const warnings = [];
-  const blocking = [];
-  const doctors = state.staffMembers.filter((staff) => staff.role === "doctor" && staff.status === "active");
-  const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
-  const minimumNursesPerShift = nurseCount + BACKUP_NURSE_COUNT;
-
-  if (doctors.length < DOCTOR_COUNT) {
-    blocking.push(`在岗医生不足：每班需要 ${DOCTOR_COUNT} 名，当前只有 ${doctors.length} 名。`);
-  }
-  if (nurses.length < minimumNursesPerShift) {
-    blocking.push(`在岗护士不足：每班需要 ${minimumNursesPerShift} 名（含后备），当前只有 ${nurses.length} 名。`);
-  }
-  if (blocking.length) {
-    return { schedule, warnings, blocking };
-  }
-
-  const usedToday = new Set();
-  STAFF_SHIFT_KEYS.forEach((shift) => {
-    const selectedDoctors = chooseStaffForShift(doctors, DOCTOR_COUNT, shift, usedToday);
-    selectedDoctors.forEach((staff) => usedToday.add(staff.id));
-    schedule[shift].doctors = selectedDoctors.map((staff) => staff.id);
-
-    const selectedNurses = chooseStaffForShift(nurses, nurseCount, shift, usedToday);
-    selectedNurses.forEach((staff) => usedToday.add(staff.id));
-    schedule[shift].nurses = selectedNurses.map((staff) => staff.id);
-
-    const usedThisShift = new Set([...schedule[shift].doctors, ...schedule[shift].nurses]);
-    const backup = chooseStaffForShift(
-      nurses.filter((staff) => !usedThisShift.has(staff.id)),
-      BACKUP_NURSE_COUNT,
-      shift,
-      usedToday,
-    )[0];
-    if (backup) {
-      schedule[shift].backupNurse = backup.id;
-      usedToday.add(backup.id);
-    }
-  });
-
-  const filledDoctors = STAFF_SHIFT_KEYS.reduce((count, shift) => count + schedule[shift].doctors.filter(Boolean).length, 0);
-  const filledNurses = STAFF_SHIFT_KEYS.reduce((count, shift) => count + schedule[shift].nurses.filter(Boolean).length + (schedule[shift].backupNurse ? 1 : 0), 0);
-  const repeatedStaff = getRepeatedStaffInDay(schedule);
-  if (filledDoctors < DOCTOR_COUNT * STAFF_SHIFT_KEYS.length) {
-    warnings.push("医生人数不足以完全避免跨班重复，系统已优先按倾向和均衡原则安排。");
-  }
-  if (filledNurses < minimumNursesPerShift * STAFF_SHIFT_KEYS.length) {
-    warnings.push("护士人数不足以完全避免跨班重复，系统已优先按倾向和均衡原则安排。");
-  }
-  if (repeatedStaff.length) {
-    warnings.push(`为保证岗位数量，以下医护存在跨班安排：${repeatedStaff.map(getStaffDisplayName).join("、")}。`);
-  }
-
-  return { schedule, warnings, blocking };
-}
-
-function getRepeatedStaffInDay(staffSchedule) {
-  const counts = new Map();
-  STAFF_SHIFT_KEYS.forEach((shift) => {
-    const shiftSchedule = staffSchedule[shift];
-    [...shiftSchedule.doctors, ...shiftSchedule.nurses, shiftSchedule.backupNurse].filter(Boolean).forEach((staffId) => {
-      counts.set(staffId, (counts.get(staffId) || 0) + 1);
-    });
-  });
-  return [...counts.entries()].filter(([, count]) => count > 1).map(([staffId]) => staffId);
-}
-
-function chooseStaffForShift(staffList, count, shift, usedToday) {
-  const preferred = staffList
-    .filter((staff) => !usedToday.has(staff.id))
-    .sort((a, b) => scoreShiftPreference(b, shift) - scoreShiftPreference(a, shift) || sortStaffMembers(a, b));
-  const fallback = staffList
-    .filter((staff) => usedToday.has(staff.id))
-    .sort((a, b) => scoreShiftPreference(b, shift) - scoreShiftPreference(a, shift) || sortStaffMembers(a, b));
-  return [...preferred, ...fallback].slice(0, count);
-}
-
-function sortAutoPatients(a, b) {
-  const fixedScore = Number(Boolean(b.fixedMachineId)) - Number(Boolean(a.fixedMachineId));
-  if (fixedScore) {
-    return fixedScore;
-  }
-  const infectionScore = Number(isInfectiousPatient(b)) - Number(isInfectiousPatient(a));
-  if (infectionScore) {
-    return infectionScore;
-  }
-  const severeScore = Number(isSeverePatient(b)) - Number(isSeverePatient(a));
-  if (severeScore) {
-    return severeScore;
-  }
-  const preferenceScore = Number(Boolean(b.preferredShift)) - Number(Boolean(a.preferredShift));
-  if (preferenceScore) {
-    return preferenceScore;
-  }
-  const weeklyScore = clampNumber(b.weeklyTreatmentCount, 1, 6, 3) - clampNumber(a.weeklyTreatmentCount, 1, 6, 3);
-  if (weeklyScore) {
-    return weeklyScore;
-  }
-  const hdfScore = clampNumber(b.monthlyHdfCount, 0, 4, 1) - clampNumber(a.monthlyHdfCount, 0, 4, 1);
-  if (hdfScore) {
-    return hdfScore;
-  }
-  const treatmentScore = normalizeMachineType(a.treatmentType).localeCompare(normalizeMachineType(b.treatmentType), "zh-CN");
-  if (treatmentScore) {
-    return treatmentScore;
-  }
-  return sortPatients(a, b);
-}
-
-function isInfectiousPatient(patient) {
-  return Boolean(normalizeInfectionFlag(patient?.infectionFlag));
-}
-
-function isSeverePatient(patient) {
-  return normalizeCareLevel(patient?.careLevel) === SEVERE_CARE_LEVEL;
-}
-
-function getPatientCareLabel(patient) {
-  return isSeverePatient(patient) ? "严重组" : "普通组";
-}
-
-function getRequiredPatientZoneLabel(patient) {
-  const infectionFlag = normalizeInfectionFlag(patient?.infectionFlag);
-  if (infectionFlag) {
-    return `${infectionFlag}区`;
-  }
-  return isSeverePatient(patient) ? "重病区" : "普通区";
-}
-
-function getEligibleMachinePool(patient, specialMachines, regularMachines) {
-  return getEligibleMachinePoolForTreatment(patient, patient.treatmentType, specialMachines, regularMachines);
-}
-
-function getEligibleMachinePoolForTreatment(patient, treatmentType, specialMachines, regularMachines) {
-  const normalizedTreatmentType = normalizeMachineType(treatmentType);
-  return getAvailableMachineIds().filter((machineId) => patientFitsMachineForTreatment(patient, normalizedTreatmentType, machineId));
-}
-
-function machineSupportsTreatment(machineId, treatmentType) {
-  const machineType = getMachineType(machineId);
-  const normalizedTreatmentType = normalizeMachineType(treatmentType);
-  // 机器类型严格固定：血透只用血透机，血滤只用血滤机，灌流只用灌流机。
-  return machineType === normalizedTreatmentType;
-}
-
-function patientFitsMachine(patient, machineId) {
-  if (!patient) {
-    return false;
-  }
-  return patientFitsMachineForTreatment(patient, patient.treatmentType, machineId);
-}
-
-function patientFitsMachineForTreatment(patient, treatmentType, machineId) {
-  if (!patient) {
-    return false;
-  }
-  return patientZoneMatchesMachine(patient, machineId) && machineSupportsTreatment(machineId, treatmentType);
-}
-
-function patientFitsMachineSettings(patient, machineType, machineZone, treatmentType = patient?.treatmentType) {
-  return patientZoneMatchesMachineZone(patient, machineZone) && machineTypeSupportsTreatment(machineType, treatmentType);
-}
-
-function patientZoneMatchesMachine(patient, machineId) {
-  return patientZoneMatchesMachineZone(patient, getMachineZone(machineId));
-}
-
-function patientZoneMatchesMachineZone(patient, machineZone) {
-  const zone = normalizeMachineZone(machineZone);
-  const infectionFlag = normalizeInfectionFlag(patient?.infectionFlag);
-  if (infectionFlag) {
-    return zone === MACHINE_ZONE_INFECTION || zone === infectionFlag;
-  }
-
-  // 普通区与重病区均属于非传染区，可互相调配机器；传染病机器始终隔离。
-  return zone === MACHINE_ZONE_NORMAL || zone === MACHINE_ZONE_SEVERE;
-}
-
-function machineTypeSupportsTreatment(machineType, treatmentType) {
-  const normalizedMachineType = normalizeMachineType(machineType);
-  const normalizedTreatmentType = normalizeMachineType(treatmentType);
-  // 布局校验同样执行严格一一对应，不允许血滤机承担血透。
-  return normalizedMachineType === normalizedTreatmentType;
-}
-
-function getAssignmentCompatibilityIssues(machineId, nextType, nextZone) {
-  const issues = [];
-  const seen = new Set();
-  const addIssue = (label, shift, patient, treatmentType = patient?.treatmentType) => {
-    const key = `${label}:${shift}:${patient.id}:${normalizeMachineType(treatmentType)}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    const zone = isInfectiousPatient(patient) ? normalizeInfectionFlag(patient.infectionFlag) : getPatientCareLabel(patient);
-    issues.push(`${label} ${SHIFT_LABELS[shift]}：${patient.name}（${MACHINE_TYPE_LABELS[normalizeMachineType(treatmentType)]}，${zone}）`);
-  };
-  const scan = (collection, labelForKey) => {
-    Object.entries(collection || {}).forEach(([key, daySchedule]) => {
-      const item = daySchedule?.[machineId];
-      if (!item) {
-        return;
-      }
-      STAFF_SHIFT_KEYS.forEach((shift) => {
-        const slot = item[shift];
-        const patient = slot?.patientId ? findPatient(slot.patientId) : null;
-        const treatmentType = normalizeMachineType(slot?.treatmentType || patient?.treatmentType);
-        if (patient && !patientFitsMachineSettings(patient, nextType, nextZone, treatmentType)) {
-          addIssue(labelForKey(key), shift, patient, treatmentType);
-        }
-      });
-    });
-  };
-
-  scan(state.weeklySchedules, (key) => `每周${getWeekDayLabel(key)}`);
-  scan(state.schedules, (key) => formatDateLabel(key));
-  state.patients
-    .filter((patient) => patient.fixedMachineId === machineId && !patientFitsMachineSettings(patient, nextType, nextZone))
-    .forEach((patient) => {
-      const key = `fixed:${patient.id}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        const zone = isInfectiousPatient(patient) ? normalizeInfectionFlag(patient.infectionFlag) : getPatientCareLabel(patient);
-        issues.push(`长期固定机位：${patient.name}（${getPatientTreatmentLabel(patient)}，${zone}）`);
-      }
-    });
-  return issues;
-}
-
-function getPatientCompatibilityIssues(patient) {
-  const issues = [];
-  const seen = new Set();
-  const addIssue = (label, shift, machineId) => {
-    const key = `${label}:${shift}:${machineId}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    issues.push(`${label} ${SHIFT_LABELS[shift]}：${machineId}（${getMachineTypeLabel(machineId)}，${getMachineZoneLabel(machineId)}）`);
-  };
-  const scan = (collection, labelForKey, useSlotTreatment) => {
-    Object.entries(collection || {}).forEach(([key, daySchedule]) => {
-      Object.entries(daySchedule || {}).forEach(([machineId, item]) => {
-        STAFF_SHIFT_KEYS.forEach((shift) => {
-          const slot = item[shift];
-          if (slot?.patientId !== patient.id) {
-            return;
-          }
-          const treatmentType = useSlotTreatment
-            ? normalizeMachineType(slot.treatmentType || patient.treatmentType)
-            : normalizeMachineType(patient.treatmentType);
-          if (!patientFitsMachineForTreatment(patient, treatmentType, machineId)) {
-            addIssue(labelForKey(key), shift, machineId);
-          }
-        });
-      });
-    });
-  };
-
-  scan(state.weeklySchedules, (key) => `每周${getWeekDayLabel(key)}`, false);
-  scan(state.schedules, (key) => formatDateLabel(key), true);
-  return issues;
-}
-
-function getShiftsByCurrentLoad(schedule, machines) {
-  const daySchedule = getScheduleDay(schedule);
-  return [...STAFF_SHIFT_KEYS].sort((left, right) => countAssigned(daySchedule, machines, left) - countAssigned(daySchedule, machines, right));
-}
-
-function findBestMachineForPatient(patient, machinePool, shift, schedule, priority = state.settings.schedulePriority) {
-  const daySchedule = getScheduleDay(schedule);
-  const freeMachines = machinePool.filter((machineId) => !daySchedule[machineId]?.[shift]);
-  if (!freeMachines.length) {
-    return "";
-  }
-
-  // 先按区域和物理距离筛出最可能的紧凑机位，再对少量候选执行完整护士分组评估，避免大批量排班时页面长时间卡死。
-  const preferredZone = isSeverePatient(patient) ? MACHINE_ZONE_SEVERE : MACHINE_ZONE_NORMAL;
-  const preliminary = freeMachines
-    .map((machineId) => ({
-      machineId,
-      zonePenalty: Number(getMachineZone(machineId) !== preferredZone),
-      proximity: getMachineProximityScore(daySchedule, shift, machineId),
-    }))
-    .sort((left, right) => {
-      if (isCompactResourcePriority(priority)) {
-        return left.proximity - right.proximity || left.zonePenalty - right.zonePenalty || sortMachineIds(left.machineId, right.machineId);
-      }
-      return left.zonePenalty - right.zonePenalty || left.proximity - right.proximity || sortMachineIds(left.machineId, right.machineId);
-    });
-  const shortlist = preliminary.slice(0, Math.min(8, preliminary.length));
-  const metrics = new Map(shortlist.map(({ machineId }) => [machineId, getProjectedNurseGroupMetrics(daySchedule, shift, machineId, patient)]));
-  return shortlist.sort((left, right) => {
-    const leftMetrics = metrics.get(left.machineId);
-    const rightMetrics = metrics.get(right.machineId);
-    const groupDiff = leftMetrics.groupCount - rightMetrics.groupCount;
-    const compactnessDiff = leftMetrics.compactness - rightMetrics.compactness;
-    if (isCompactResourcePriority(priority)) {
-      return groupDiff || compactnessDiff || left.zonePenalty - right.zonePenalty || left.proximity - right.proximity || sortMachineIds(left.machineId, right.machineId);
-    }
-    return left.zonePenalty - right.zonePenalty || groupDiff || compactnessDiff || left.proximity - right.proximity || sortMachineIds(left.machineId, right.machineId);
-  })[0].machineId;
-}
-
-function getMachineProximityScore(daySchedule, shift, candidateMachineId, settings = state.settings) {
-  const candidateZone = getNurseZoneKey(candidateMachineId, settings);
-  const positionMap = getMachinePositionMap(settings);
-  const candidatePosition = positionMap.get(String(candidateMachineId));
-  const assignedMachines = getMachineIds(settings).filter((machineId) =>
-    daySchedule[machineId]?.[shift]?.patientId && getNurseZoneKey(machineId, settings) === candidateZone,
-  );
-  if (!assignedMachines.length) {
-    return getNurseMachinePathIndex(candidateMachineId, settings, positionMap);
-  }
-
-  return Math.min(...assignedMachines.map((machineId) => {
-    const position = positionMap.get(String(machineId));
-    if (!candidatePosition || !position) {
-      return Math.abs(Number(candidateMachineId) - Number(machineId));
-    }
-    return Math.abs(candidatePosition.row - position.row) * settings.machinesPerRow + Math.abs(candidatePosition.column - position.column);
-  }));
-}
-
-function getProjectedNurseGroupMetrics(daySchedule, shift, machineId, patient) {
-  const projected = structuredClone(daySchedule || {});
-  if (!projected[machineId]) {
-    projected[machineId] = {};
-  }
-  projected[machineId][shift] = {
-    patientId: patient?.id || "__projected_patient__",
-    treatmentType: normalizeMachineType(patient?.treatmentType),
-  };
-  const groups = getNurseGroupsForShift(projected, shift).filter((group) => !group.empty);
-  return {
-    groupCount: groups.length,
-    compactness: groups.reduce((total, group) => total + getNurseSegmentCompactness(group.machines), 0),
-  };
 }
 
 function getScheduleDay(schedule) {
@@ -4819,6 +7661,136 @@ function isSpecialMachine(machineId) {
   return isInfectionMachineZone(getMachineZone(machineId));
 }
 
+function machineSupportsTreatment(machineId, treatmentType, settings = state.settings) {
+  return getMachineType(machineId, settings) === normalizeMachineType(treatmentType);
+}
+
+function patientFitsMachineSettings(patient, machineType, machineZone, treatmentType = patient?.treatmentType) {
+  if (!patient) return false;
+  const requiredType = normalizeMachineType(treatmentType || patient.treatmentType);
+  const type = normalizeMachineType(machineType);
+  if (type !== requiredType) {
+    return false;
+  }
+
+  const zone = normalizeMachineZone(machineZone);
+  const infection = normalizeInfectionFlag(patient.infectionFlag);
+  if (infection) {
+    return zone === MACHINE_ZONE_INFECTION || zone === infection;
+  }
+  return zone === MACHINE_ZONE_NORMAL || zone === MACHINE_ZONE_SEVERE;
+}
+
+function patientFitsMachine(patient, machineId, settings = state.settings) {
+  return patientFitsMachineForTreatment(patient, patient?.treatmentType, machineId, settings);
+}
+
+function patientFitsMachineForTreatment(patient, treatmentType, machineId, settings = state.settings) {
+  const id = String(machineId || "");
+  return Boolean(
+    id &&
+    getMachineIds(settings).includes(id) &&
+    patientFitsMachineSettings(
+      patient,
+      getMachineType(id, settings),
+      getMachineZone(id, settings),
+      treatmentType,
+    )
+  );
+}
+
+function getMachineZonePreferenceScore(patient, machineId, settings = state.settings) {
+  const zone = getMachineZone(machineId, settings);
+  const infection = normalizeInfectionFlag(patient?.infectionFlag);
+  if (infection) {
+    if (zone === infection) return 0;
+    if (zone === MACHINE_ZONE_INFECTION) return 1;
+    return 20;
+  }
+  if (isSeverePatient(patient)) {
+    return zone === MACHINE_ZONE_SEVERE ? 0 : 2;
+  }
+  return zone === MACHINE_ZONE_NORMAL ? 0 : 1;
+}
+
+function getEligibleMachinePoolForTreatment(patient, treatmentType, specialMachines = getSpecialMachines(), regularMachines = getAvailableMachineIds()) {
+  const available = new Set(getAvailableMachineIds());
+  const infection = normalizeInfectionFlag(patient?.infectionFlag);
+  const base = infection
+    ? [...specialMachines, ...getAvailableMachineIds().filter((machineId) => isInfectionMachineZone(getMachineZone(machineId)))]
+    : [
+        ...regularMachines,
+        ...getSevereMachines(),
+        ...getAvailableMachineIds().filter((machineId) => {
+          const zone = getMachineZone(machineId);
+          return zone === MACHINE_ZONE_NORMAL || zone === MACHINE_ZONE_SEVERE;
+        }),
+      ];
+
+  return [...new Set(base.map(String))]
+    .filter((machineId) => available.has(machineId))
+    .filter((machineId) => patientFitsMachineForTreatment(patient, treatmentType, machineId))
+    .sort((left, right) =>
+      getMachineZonePreferenceScore(patient, left) - getMachineZonePreferenceScore(patient, right) ||
+      sortMachineIds(left, right),
+    );
+}
+
+function findBestMachineForPatient(patient, machinePool, shift, daySchedule = {}, priority = state.settings.schedulePriority, fastMachineSelection = false, treatmentType = patient?.treatmentType) {
+  const schedule = getScheduleDay(daySchedule);
+  const resolvedTreatmentType = normalizeMachineType(treatmentType || patient?.treatmentType);
+  const candidates = [...new Set((machinePool || []).map(String))]
+    .filter((machineId) => !schedule?.[machineId]?.[shift]?.patientId)
+    .filter((machineId) => !isMachinePaused(machineId))
+    .filter((machineId) => patientFitsMachineForTreatment(patient, resolvedTreatmentType, machineId))
+    .filter((machineId) => !isPatientAlreadyAssignedInDay(patient.id, schedule))
+    .filter((machineId) => fastMachineSelection || candidateKeepsNurseGroupsValid(machineId, shift, schedule, patient, resolvedTreatmentType));
+
+  if (!candidates.length) {
+    return "";
+  }
+
+  const compactPriority = isCompactResourcePriority(priority);
+  return candidates
+    .map((machineId) => ({
+      machineId,
+      zonePreference: getMachineZonePreferenceScore(patient, machineId),
+      machineLoad: STAFF_SHIFT_KEYS.filter((key) => schedule?.[machineId]?.[key]?.patientId).length,
+      shiftLoad: countAssigned(schedule, getMachineIds(), shift),
+      weeklyOrder: getNurseMachinePathIndex(machineId),
+    }))
+    .sort((left, right) =>
+      left.zonePreference - right.zonePreference ||
+      (compactPriority ? right.machineLoad - left.machineLoad : left.machineLoad - right.machineLoad) ||
+      left.shiftLoad - right.shiftLoad ||
+      left.weeklyOrder - right.weeklyOrder ||
+      sortMachineIds(left.machineId, right.machineId),
+    )[0].machineId;
+}
+
+function isPatientAlreadyAssignedInDay(patientId, daySchedule = {}) {
+  if (!patientId) return false;
+  return Object.values(daySchedule || {}).some((machine) =>
+    STAFF_SHIFT_KEYS.some((shift) => machine?.[shift]?.patientId === patientId),
+  );
+}
+
+function candidateKeepsNurseGroupsValid(machineId, shift, daySchedule, patient, treatmentType) {
+  const simulated = structuredClone(daySchedule || {});
+  if (!simulated[machineId]) simulated[machineId] = {};
+  simulated[machineId][shift] = {
+    patientId: patient.id,
+    treatmentType: normalizeMachineType(treatmentType),
+    updatedAt: new Date().toISOString(),
+  };
+  return getNurseGroupsForShift(simulated, shift, state.settings)
+    .filter((group) => group && !group.empty)
+    .every((group) =>
+      group.patientCount <= group.capacity &&
+      group.hemofiltrationMachineCount <= MAX_HEMOFILTRATION_MACHINES_PER_NURSE,
+    );
+}
+
 function setMachineType(machineId, type) {
   const validMachines = new Set(getMachineIds());
   if (!validMachines.has(machineId)) {
@@ -5098,7 +8070,7 @@ function getNurseZoneKey(machineId, settings = state.settings) {
   if (zone === MACHINE_ZONE_NORMAL || zone === MACHINE_ZONE_SEVERE || zone === MACHINE_ZONE_INFECTION) {
     return zone;
   }
-  return MACHINE_ZONE_INFECTION_FLAGS.includes(zone) ? zone : MACHINE_ZONE_NORMAL;
+  return MACHINE_ZONE_INFECTION_FLAGS.includes(zone) ? MACHINE_ZONE_INFECTION : MACHINE_ZONE_NORMAL;
 }
 
 function getNurseZoneLabel(zoneKey, settings = state.settings) {
@@ -5109,9 +8081,9 @@ function getNurseZoneLabel(zoneKey, settings = state.settings) {
     return "重病区";
   }
   if (zoneKey === MACHINE_ZONE_INFECTION) {
-    return settings.specialZoneName || "通用传染区";
+    return settings.specialZoneName || "传染区";
   }
-  return MACHINE_ZONE_INFECTION_FLAGS.includes(zoneKey) ? `${zoneKey}区` : "普通区";
+  return MACHINE_ZONE_INFECTION_FLAGS.includes(zoneKey) ? (settings.specialZoneName || "传染区") : "普通区";
 }
 
 function buildNurseGroupsForMachines(machineIds, capacity, zoneKey, settings = state.settings) {
@@ -5478,10 +8450,92 @@ function getAssignmentsForPatientInDay(patientId, daySchedule) {
   return assignments;
 }
 
+function getWeeklyLocationsForPatient(weeklySchedules = {}, patientId) {
+  const locations = [];
+  Object.entries(weeklySchedules || {}).forEach(([dayKey, daySchedule]) => {
+    getAssignmentsForPatientInDay(patientId, daySchedule).forEach((assignment) => {
+      locations.push({ dayKey, ...assignment });
+    });
+  });
+  return locations;
+}
+
+function getPatientCompatibilityIssues(patient) {
+  const issues = [];
+  const scanDay = (label, daySchedule) => {
+    Object.entries(daySchedule || {}).forEach(([machineId, machine]) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        const slot = machine?.[shift];
+        if (!slot || slot.removed || slot.patientId !== patient.id) {
+          return;
+        }
+        if (!getMachineIds().includes(String(machineId))) {
+          issues.push(`${label}${SHIFT_LABELS[shift]}：${machineId} 号机不存在`);
+          return;
+        }
+        const treatmentType = normalizeScheduleSlotSource(slot.source, slot.note) === AUTO_OVERRIDE_SOURCE_MONTHLY_HDF
+          ? slot.treatmentType
+          : patient.treatmentType;
+        if (!patientFitsMachineSettings(patient, getMachineType(machineId), getMachineZone(machineId), treatmentType)) {
+          issues.push(`${label}${SHIFT_LABELS[shift]}：${machineId} 号机与新的治疗类型、感染标识或护理组别不匹配`);
+        }
+      });
+    });
+  };
+
+  Object.entries(state.weeklySchedules || {}).forEach(([dayKey, daySchedule]) => {
+    scanDay(`周模板${getWeekDayLabel(dayKey)}`, daySchedule);
+  });
+  Object.entries(state.schedules || {}).forEach(([date, daySchedule]) => {
+    scanDay(`${formatDateLabel(date)}`, daySchedule);
+  });
+  return dedupeMessages(issues);
+}
+
+function getAssignmentCompatibilityIssues(machineId, machineType, machineZone) {
+  const issues = [];
+  const id = String(machineId);
+  const scanDay = (label, daySchedule) => {
+    const machine = daySchedule?.[id];
+    if (!machine) {
+      return;
+    }
+    STAFF_SHIFT_KEYS.forEach((shift) => {
+      const slot = machine?.[shift];
+      if (!slot || slot.removed || !slot.patientId) {
+        return;
+      }
+      const patient = findPatient(slot.patientId);
+      if (!patient) {
+        return;
+      }
+      const treatmentType = slot.treatmentType || patient.treatmentType;
+      if (!patientFitsMachineSettings(patient, machineType, machineZone, treatmentType)) {
+        issues.push(`${label}${SHIFT_LABELS[shift]}：${patient.name}`);
+      }
+    });
+  };
+
+  Object.entries(state.weeklySchedules || {}).forEach(([dayKey, daySchedule]) => {
+    scanDay(`周模板${getWeekDayLabel(dayKey)}`, daySchedule);
+  });
+  Object.entries(state.schedules || {}).forEach(([date, daySchedule]) => {
+    scanDay(`${formatDateLabel(date)}`, daySchedule);
+  });
+  state.patients
+    .filter((patient) => patient.fixedMachineId === id)
+    .forEach((patient) => {
+      if (!patientFitsMachineSettings(patient, machineType, machineZone, patient.treatmentType)) {
+        issues.push(`长期固定机位：${patient.name}`);
+      }
+    });
+  return dedupeMessages(issues);
+}
+
 
 function validateGeneratedWeeklySafety(weeklySchedules, weeklyStaffSchedules) {
   const errors = [];
-  const activePatients = state.patients.filter((patient) => patient.status === "active");
+  const activePatients = getSchedulablePatients();
   const weeklyCounts = new Map(activePatients.map((patient) => [patient.id, 0]));
 
   WORKING_DAY_KEYS.forEach((dayKey) => {
@@ -5632,7 +8686,8 @@ function validateDayPatientSafety(daySchedule, options = {}) {
       if (!patientFitsMachineSettings(patient, machineType, machineZone, treatmentType)) {
         errors.push(`${label}${SHIFT_LABELS[shift]} ${patient.name} 与 ${machineId} 号机分区或机型不匹配。`);
       }
-      if (weekly && patient.fixedMachineId && String(patient.fixedMachineId) !== String(machineId)) {
+      const isBaseTreatment = normalizeMachineType(treatmentType) === normalizeMachineType(patient.treatmentType);
+      if (weekly && isBaseTreatment && patient.fixedMachineId && String(patient.fixedMachineId) !== String(machineId)) {
         errors.push(`${label}${SHIFT_LABELS[shift]} ${patient.name} 未使用其长期固定机位 ${patient.fixedMachineId}。`);
       }
       const patientKey = String(patient.id);
@@ -5781,7 +8836,7 @@ function patientMatches(patient, keyword) {
     return true;
   }
 
-  return [patient.name, patient.dialysisNo, patient.phone, patient.vascularAccess, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), patient.infectionFlag, formatDayPreference(patient.preferredDays)]
+  return [patient.name, patient.dialysisNo, patient.phone, patient.vascularAccess, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), patient.infectionFlag, formatDayPreference(patient.preferredDays), patient.forcePreferredDays && "强制个性化", patient.temporaryInsert && "临时患者"]
     .filter(Boolean)
     .some((value) => String(value).toLowerCase().includes(keyword));
 }
@@ -5820,10 +8875,15 @@ function getPatientTreatmentLabel(patient) {
   return MACHINE_TYPE_LABELS[normalizeMachineType(patient?.treatmentType)] || MACHINE_TYPE_LABELS[DEFAULT_MACHINE_TYPE];
 }
 
-function formatPreference(preferredShift, preferredDays = []) {
+function getTreatmentLabel(treatmentType) {
+  return MACHINE_TYPE_LABELS[normalizeMachineType(treatmentType)] || MACHINE_TYPE_LABELS[DEFAULT_MACHINE_TYPE];
+}
+
+function formatPreference(preferredShift, preferredDays = [], forcePreferredDays = false) {
   const shift = preferredShift ? SHIFT_LABELS[preferredShift] : "不限";
   const days = formatDayPreference(preferredDays);
-  return days ? `${shift} · ${days}` : shift;
+  const base = days ? `${shift} · ${days}` : shift;
+  return forcePreferredDays ? `${base} · 强制个性化` : base;
 }
 
 function formatDayPreference(preferredDays = []) {
@@ -5851,8 +8911,8 @@ function setCheckedValues(container, values) {
 }
 
 function buildPatientSubline(patient) {
-  const plan = `${patient.weeklyTreatmentCount || 3}次/周，血滤${patient.monthlyHdfCount ?? 1}次/月`;
-  return [patient.dialysisNo && `透析号 ${patient.dialysisNo}`, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), `机位 ${getPatientFixedMachineLabel(patient)}`, plan, patient.vascularAccess, patient.infectionFlag]
+  const plan = `${patient.weeklyTreatmentCount || 3}次/周，血滤${patient.monthlyHdfCount ?? 2}次/4周`;
+  return [patient.dialysisNo && `透析号 ${patient.dialysisNo}`, getPatientTreatmentLabel(patient), getPatientCareLabel(patient), `机位 ${getPatientFixedMachineLabel(patient)}`, plan, patient.temporaryInsert && "临时患者", patient.forcePreferredDays && "强制个性化", patient.vascularAccess, patient.infectionFlag]
     .filter(Boolean)
     .join(" · ") || "资料待完善";
 }

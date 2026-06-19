@@ -8,7 +8,7 @@
 <meta content="no-cache" http-equiv="Pragma"/>
 <meta content="0" http-equiv="Expires"/>
 <title>血透室本地排班系统</title>
-<link href="styles.css?v=20260617-28" rel="stylesheet"/>
+<link href="styles.css?v=20260619-person-card-report" rel="stylesheet"/>
 </head>
 <body>
 <div class="app-shell">
@@ -50,19 +50,37 @@
 </nav>
 <main>
 <section class="view active" id="scheduleView">
+<div class="schedule-quick-actions">
+  <button class="primary-button" id="openInsertPatientTop" type="button">临时插入患者</button>
+  <span>只给新人找空位；不会移动任何已经排好的患者。</span>
+</div>
 <div class="summary-grid" id="summaryGrid"></div>
-<section aria-label="周排班导航" class="week-board" data-i18n-aria-label="static_173">
-<div class="week-toolbar">
-<button class="ghost-button" id="prevWeek" type="button"><span data-i18n="static_015">上一周</span></button>
-<div>
-<h2 id="weekTitle"><span data-i18n="static_016">本周排班</span></h2>
-<p id="weekMeta"><span data-i18n="static_017">默认读取每周模板，可对单日单独调整</span></p>
-</div>
-<button class="ghost-button" id="nextWeek" type="button"><span data-i18n="static_018">下一周</span></button>
-<button class="ghost-button" id="todayButton" type="button"><span data-i18n="static_019">今天</span></button>
-</div>
-<div class="week-day-strip" id="weekDayStrip"></div>
+<section aria-label="2周循环排班与当日操作导航" class="week-board two-week-cycle-board" data-i18n-aria-label="static_173">
+  <div class="cycle-toolbar">
+    <div>
+      <h2>固定2周循环排班</h2>
+      <p>界面按本周、下周滚动显示；系统内部自动套用长期2周循环的第1周或第2周模板。</p>
+    </div>
+    
+  </div>
+
+  <div class="cycle-week-tabs" id="cycleWeekTabs">
+    <button class="cycle-week-tab active" data-week-offset="0" type="button">本周</button>
+    <button class="cycle-week-tab" data-week-offset="1" type="button">下周</button>
+  </div>
+
+  <div class="week-toolbar">
+    <button class="ghost-button" id="prevWeek" type="button">本周</button>
+    <div>
+      <h2 id="weekTitle">本周排班</h2>
+      <p id="weekMeta">本周使用长期2周循环对应模板。</p>
+    </div>
+    <button class="ghost-button" id="nextWeek" type="button">下周</button>
+    <button class="ghost-button" id="todayButton" type="button">回到本周</button>
+  </div>
+  <div class="week-day-strip" id="weekDayStrip"></div>
 </section>
+
 <section aria-label="机器排班表" class="machine-board" data-i18n-aria-label="static_174">
 <div class="board-toolbar">
 <div>
@@ -70,6 +88,12 @@
 <p id="boardMeta"></p>
 </div>
 <div class="board-actions">
+<div class="cycle-actions-inline">
+<button class="primary-button" id="generateTwoWeekPlan" type="button">生成2周排班</button>
+      <button class="ghost-button" id="openInsertPatient" type="button">临时插入患者</button>
+      <button class="ghost-button" id="saveTwoWeekTemplate" type="button">保存为长期2周循环模板</button>
+      <button class="ghost-button" id="openTwoWeekReview" type="button">生成当前2周排班报告</button>
+</div>
 <label class="schedule-priority-control">
 <span id="schedulePriorityLabel"><span data-i18n="static_021">排班策略</span></span>
 <select id="schedulePriority">
@@ -78,10 +102,14 @@
 <option value="smart">灵巧排班</option>
 </select>
 </label>
-<button class="primary-button" id="autoScheduleDay" type="button"><span data-i18n="static_025">生成长期周模板建议</span></button>
-<button class="ghost-button" id="saveDayAsWeeklyTemplate" type="button"><span data-i18n="static_026">本周设为长期模板</span></button>
-<button class="ghost-button" id="copyPreviousDay" type="button"><span data-i18n="static_027">复制前一天</span></button>
-<button class="danger-button" id="clearDay" type="button"><span data-i18n="static_028">清空当日</span></button>
+<label class="schedule-priority-control staff-work-mode-control">
+<span id="staffWorkModeLabel">护士上班方式</span>
+<select id="staffWorkMode">
+<option value="balanced">均衡轮班</option>
+<option value="full_day">整日优先</option>
+<option value="rest_max">休息最大化</option>
+</select>
+</label>
 </div>
 </div>
 <div class="machine-rows" id="machineRows"></div>
@@ -204,6 +232,11 @@
 <label><input type="checkbox" value="6"/><span data-i18n="static_075">周六</span></label>
 <label><input type="checkbox" value="0"/><span data-i18n="static_076">周日</span></label>
 </div>
+<label class="force-preference-option">
+<input id="forcePreferredDays" type="checkbox"/>
+<span>强制个性化</span>
+<small>选中后，每周必须按上面勾选的星期几排班；排不下时系统会报错，不会自动挪到其他日期。</small>
+</label>
 </fieldset>
 <label class="full-field">
 <span><span data-i18n="static_077">备注</span></span>
@@ -469,6 +502,46 @@
 </div>
 </form>
 </dialog>
+
+<dialog class="schedule-review-dialog" id="scheduleReviewDialog">
+  <div class="schedule-review-shell">
+    <div class="dialog-header schedule-review-header">
+      <div>
+        <h2 id="scheduleReviewTitle">自动排班总结与人工复核</h2>
+        <p id="scheduleReviewMeta">汇总患者、医护、班次、机位变化和人工复核建议</p>
+      </div>
+      <button class="ghost-button" id="closeScheduleReview" type="button">关闭</button>
+    </div>
+    <div class="schedule-review-toolbar">
+      <button class="ghost-button" id="printScheduleReview" type="button">打印总结</button>
+      <button class="primary-button" id="confirmScheduleReview" type="button">确认并保存长期周模板</button>
+    </div>
+    <div class="schedule-review-content" id="scheduleReviewContent"></div>
+  </div>
+</dialog>
+
+
+<dialog class="two-week-review-dialog" id="twoWeekReviewDialog">
+  <div class="two-week-review-shell">
+    <div class="dialog-header">
+      <div class="two-week-review-heading">
+        <h2 id="twoWeekReviewTitle">请复核：当前2周排班报告</h2>
+        <p class="two-week-review-meta" id="twoWeekReviewMeta">
+          <span class="two-week-review-meta-label">审核重点</span>
+          <span class="two-week-review-chip">当前排班</span>
+          <span class="two-week-review-chip">2周循环</span>
+          <span class="two-week-review-chip ok">无阻止项</span>
+        </p>
+      </div>
+      <button class="ghost-button" id="closeTwoWeekReview" type="button">关闭</button>
+    </div>
+    <div class="two-week-review-toolbar">
+      <button class="ghost-button" id="printTwoWeekReview" type="button">打印2周总结</button>
+      <button class="primary-button" id="confirmTwoWeekPlan" type="button">确认保存长期2周循环模板</button>
+    </div>
+    <div class="two-week-review-content" id="twoWeekReviewContent"></div>
+  </div>
+</dialog>
 <dialog class="assignment-dialog" id="assignmentDialog">
 <form id="assignmentForm" method="dialog">
 <div class="dialog-header">
@@ -476,7 +549,7 @@
 <h2 id="assignmentTitle"><span data-i18n="static_162">安排患者</span></h2>
 <p id="assignmentSubtitle"></p>
 </div>
-<button aria-label="关闭" class="icon-button" data-i18n-aria-label="static_180" type="submit" value="cancel">×</button>
+<button aria-label="关闭" class="icon-button" data-assignment-cancel data-i18n-aria-label="static_180" type="button">×</button>
 </div>
 <label>
 <span><span data-i18n="static_163">患者</span></span>
@@ -496,14 +569,149 @@
 <div class="dialog-actions">
 <button class="danger-button" id="removeAssignment" type="button"><span data-i18n="static_168">移除</span></button>
 <div>
-<button class="ghost-button" type="submit" value="cancel"><span data-i18n="static_169">取消</span></button>
+<button class="ghost-button" data-assignment-cancel type="button"><span data-i18n="static_169">取消</span></button>
 <button class="primary-button" id="saveAssignment" type="submit" value="default"><span data-i18n="static_170">保存</span></button>
+</div>
+</div>
+</form>
+</dialog>
+<dialog class="assignment-dialog insert-patient-dialog" id="insertPatientDialog">
+<form id="insertPatientForm" method="dialog">
+<div class="dialog-header">
+<div>
+<h2>临时插入患者</h2>
+<p>只给新人找空位；找不到空位就提示失败，不会移动任何已经排好的患者。</p>
+</div>
+<button aria-label="关闭" class="icon-button" id="closeInsertPatientDialog" type="button">×</button>
+</div>
+<label>
+<span>排班保存方式</span>
+<select name="scheduleScope">
+<option value="date">仅当前日期临时排班</option>
+<option value="longTerm">加入患者库并进入长期2周循环</option>
+</select>
+</label>
+<div class="form-grid two insert-form-grid">
+<label>
+<span>姓名</span>
+<input autocomplete="off" maxlength="32" name="name" required=""/>
+</label>
+<label>
+<span>透析号</span>
+<input autocomplete="off" maxlength="32" name="dialysisNo"/>
+</label>
+<label>
+<span>性别</span>
+<select name="gender">
+<option value="">未填</option>
+<option value="男">男</option>
+<option value="女">女</option>
+</select>
+</label>
+<label>
+<span>年龄</span>
+<input max="120" min="0" name="age" type="number"/>
+</label>
+<label>
+<span>联系电话</span>
+<input autocomplete="off" maxlength="32" name="phone"/>
+</label>
+<label>
+<span>干体重 kg</span>
+<input max="300" min="0" name="dryWeight" step="0.1" type="number"/>
+</label>
+<label>
+<span>血管通路</span>
+<select name="vascularAccess">
+<option value="">未填</option>
+<option value="自体内瘘">自体内瘘</option>
+<option value="人工血管">人工血管</option>
+<option value="长期导管">长期导管</option>
+<option value="临时导管">临时导管</option>
+<option value="其他">其他</option>
+</select>
+</label>
+<label>
+<span>常规治疗</span>
+<select name="treatmentType">
+<option value="hemodialysis">血透</option>
+<option value="hemofiltration">血滤</option>
+<option value="perfusion">灌流</option>
+</select>
+</label>
+<label>
+<span>每周次数</span>
+<input max="6" min="1" name="weeklyTreatmentCount" type="number" value="3"/>
+</label>
+<label>
+<span>每4周血滤次数</span>
+<input max="4" min="0" name="monthlyHdfCount" type="number" value="1"/>
+<small class="field-hint">仅用于常规血透患者；血滤或灌流患者不再另行生成月度血滤。</small>
+</label>
+<label>
+<span>感染标识</span>
+<select name="infectionFlag">
+<option value="">无</option>
+<option value="HBC">HBC</option>
+<option value="HBV">HBV</option>
+<option value="HCV">HCV</option>
+<option value="T">T</option>
+</select>
+</label>
+<label>
+<span>护理组别</span>
+<select name="careLevel">
+<option value="standard">普通组</option>
+<option value="severe">严重组</option>
+</select>
+</label>
+<label>
+<span>常用班次</span>
+<select name="preferredShift">
+<option value="">不限</option>
+<option value="morning">上午</option>
+<option value="afternoon">下午</option>
+</select>
+</label>
+<label>
+<span>长期固定机位</span>
+<select name="fixedMachineId">
+<option value="">首次自动排班后固定</option>
+</select>
+</label>
+</div>
+<fieldset class="preference-fieldset insert-preference-fieldset">
+<legend>透析星期倾向</legend>
+<div class="checkbox-grid" data-insert-days>
+<label><input name="preferredDays" type="checkbox" value="1"/><span>周一</span></label>
+<label><input name="preferredDays" type="checkbox" value="2"/><span>周二</span></label>
+<label><input name="preferredDays" type="checkbox" value="3"/><span>周三</span></label>
+<label><input name="preferredDays" type="checkbox" value="4"/><span>周四</span></label>
+<label><input name="preferredDays" type="checkbox" value="5"/><span>周五</span></label>
+<label><input name="preferredDays" type="checkbox" value="6"/><span>周六</span></label>
+<label><input name="preferredDays" type="checkbox" value="0"/><span>周日</span></label>
+</div>
+<label class="force-preference-option">
+<input name="forcePreferredDays" type="checkbox"/>
+<span>强制个性化</span>
+<small>选中后，每周必须按上面勾选的星期几排班；排不下时系统会报错，不会自动挪到其他日期。</small>
+</label>
+</fieldset>
+<label>
+<span>备注</span>
+<textarea maxlength="300" name="note" rows="3"></textarea>
+</label>
+<div class="dialog-actions">
+<span class="insert-dialog-hint">临时排班不会进入长期循环；长期排班会同时更新2周模板。</span>
+<div>
+<button class="ghost-button" data-insert-cancel type="button">取消</button>
+<button class="primary-button" type="submit" value="default">插入并排班</button>
 </div>
 </div>
 </form>
 </dialog>
 <div aria-live="polite" class="toast" id="toast" role="status"></div>
 <script src="languages.js?v=20260617-28"></script>
-<script src="app.js?v=20260617-28"></script>
+<script src="app.js?v=20260619-person-card-report"></script>
 </body>
 </html>
