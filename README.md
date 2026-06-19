@@ -43,6 +43,9 @@
 
 作者：**捉云**
 
+<img width="963" height="1705" alt="image" src="https://github.com/user-attachments/assets/e79d1a0d-6d84-4aa8-915c-20fa01cf086f" />
+
+
 ---
 
 # Hemodialysis Room Local Scheduler
@@ -91,6 +94,7 @@ For feature requests, suggestions, or issue reports, please contact:
 Author: **Zhuo Yun**
 
 
+<img width="2610" height="1778" alt="image" src="https://github.com/user-attachments/assets/eb9edcdc-bf21-4e19-9c3d-9aedb3cd0024" />
 
 
 
