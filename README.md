@@ -1,6 +1,9 @@
 # 血透室本地排班系统
+# Hemodialysis Room Local Scheduler
 
 ## 全免费 · 全开源 · 全本地 · 超简单
+## Completely Free · Fully Open Source · 100% Local · Easy to Use
+
 
 一款面向血液透析中心的本地排班辅助软件。
 
