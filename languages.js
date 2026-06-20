@@ -1632,7 +1632,7 @@ const STATIC_UI_MESSAGES = {
     "static_135": "HCV Patient Count",
     "static_136": "T Patient Count",
     "static_137": "Severe-Care Patient Count",
-    "static_138": "Demo Monthly Hemofiltration Sessions",
+    "static_138": "Demo 4-week Hemofiltration Sessions",
     "static_139": "Generate Demo Data",
     "static_140": "Clear Demo Data",
     "static_141": "Layout Preview",

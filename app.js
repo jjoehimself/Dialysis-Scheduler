@@ -1,5 +1,7 @@
 const STORAGE_KEY = "hemodialysis-scheduler-v1";
-const APP_VERSION = "2026.06.18.19";
+const UNDO_STORAGE_KEY = `${STORAGE_KEY}-undo-history`;
+const APP_VERSION = "2026.06.21.3";
+const MAX_UNDO_SNAPSHOTS = 8;
 const SHIFT_LABELS = {
   morning: "上午",
   afternoon: "下午",
@@ -182,6 +184,11 @@ const SUPPORTED_LANGUAGE_LIST = window.SUPPORTED_LANGUAGES || [
   { code: "zh-CN", name: "简体中文", dir: "ltr" },
   { code: "en", name: "English", dir: "ltr" },
 ];
+const UI_THEMES = [
+  { key: "light", label: "明亮" },
+  { key: "eye", label: "护眼绿" },
+  { key: "dark", label: "暗黑" },
+];
 
 function normalizeLanguageCode(value) {
   const raw = String(value || "").trim();
@@ -192,6 +199,11 @@ function normalizeLanguageCode(value) {
     return "zh-CN";
   }
   return "zh-CN";
+}
+
+function normalizeTheme(value) {
+  const key = String(value || "").trim();
+  return UI_THEMES.some((theme) => theme.key === key) ? key : "light";
 }
 
 function getLanguageMeta(code = state?.settings?.language) {
@@ -220,6 +232,7 @@ const DEFAULT_STATE = {
     specialMachines: [...DEFAULT_LAYOUT_INFECTION_MACHINES],
     specialZoneName: "传染区",
     language: "zh-CN",
+    theme: "light",
   },
   patients: [],
   staffMembers: [],
@@ -279,9 +292,11 @@ function bindElements() {
     "weekDayStrip",
     "generateTwoWeekPlan",
     "openInsertPatientTop",
-    "openInsertPatient",
+    "openShiftSwap",
     "saveTwoWeekTemplate",
     "openTwoWeekReview",
+    "runScheduleSelfCheck",
+    "undoLastChange",
     "cycleWeekTabs",
     "twoWeekReviewDialog",
     "twoWeekReviewTitle",
@@ -301,6 +316,20 @@ function bindElements() {
     "schedulePriorityLabel",
     "staffWorkMode",
     "staffWorkModeLabel",
+    "shiftSwapDialog",
+    "shiftSwapForm",
+    "closeShiftSwapDialog",
+    "shiftSwapTarget",
+    "shiftSwapStartDate",
+    "shiftSwapDays",
+    "shiftSwapMode",
+    "shiftSwapCandidates",
+    "shiftSwapCandidateHint",
+    "shiftSwapResultDialog",
+    "shiftSwapResultTitle",
+    "shiftSwapResultMeta",
+    "shiftSwapResultContent",
+    "closeShiftSwapResult",
     
     "scheduleReviewDialog",
     "scheduleReviewTitle",
@@ -366,6 +395,7 @@ function bindElements() {
     "staffTableBody",
     "layoutForm",
     "languageSelect",
+    "themeSelect",
     "roomName",
     "machinesPerRow",
     "rowCount",
@@ -440,6 +470,7 @@ function bindEvents() {
   ui.resetStaffForm.addEventListener("click", resetStaffForm);
   ui.deleteStaff.addEventListener("click", deleteSelectedStaff);
   ui.languageSelect.addEventListener("change", saveLanguage);
+  ui.themeSelect.addEventListener("change", saveTheme);
   ui.patientForm.addEventListener("submit", savePatientFromForm);
   ui.patientTreatmentType.addEventListener("change", syncMonthlyHdfAvailability);
   ui.resetPatientForm.addEventListener("click", resetPatientForm);
@@ -457,9 +488,11 @@ function bindEvents() {
   ui.staffWorkMode.addEventListener("change", saveStaffWorkMode);
   ui.generateTwoWeekPlan.addEventListener("click", generateTwoWeekPlan);
   ui.openInsertPatientTop.addEventListener("click", openInsertPatientDialog);
-  ui.openInsertPatient.addEventListener("click", openInsertPatientDialog);
+  ui.openShiftSwap.addEventListener("click", openShiftSwapDialog);
   ui.saveTwoWeekTemplate.addEventListener("click", saveTwoWeekCycleTemplate);
   ui.openTwoWeekReview.addEventListener("click", openStoredTwoWeekReview);
+  ui.runScheduleSelfCheck.addEventListener("click", runScheduleSelfCheck);
+  ui.undoLastChange.addEventListener("click", restoreLastUndoSnapshot);
   ui.closeTwoWeekReview.addEventListener("click", () => closeTwoWeekReview(false));
   ui.confirmTwoWeekPlan.addEventListener("click", () => closeTwoWeekReview(true));
   ui.twoWeekReviewContent.addEventListener("click", handleTwoWeekReviewContentClick);
@@ -506,6 +539,18 @@ function bindEvents() {
   ui.closeInsertPatientDialog.addEventListener("click", closeInsertPatientDialog);
   ui.insertPatientForm.querySelectorAll("[data-insert-cancel]").forEach((button) => {
     button.addEventListener("click", closeInsertPatientDialog);
+  });
+  ui.shiftSwapForm.addEventListener("submit", handleShiftSwapSubmit);
+  ui.closeShiftSwapDialog.addEventListener("click", closeShiftSwapDialog);
+  ui.shiftSwapForm.querySelectorAll("[data-shift-swap-cancel]").forEach((button) => {
+    button.addEventListener("click", closeShiftSwapDialog);
+  });
+  ui.shiftSwapTarget.addEventListener("change", renderShiftSwapCandidates);
+  ui.shiftSwapMode.addEventListener("change", syncShiftSwapCandidateHint);
+  ui.closeShiftSwapResult.addEventListener("click", () => ui.shiftSwapResultDialog.close());
+  ui.shiftSwapResultDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    ui.shiftSwapResultDialog.close();
   });
   getInsertFormField("treatmentType")?.addEventListener("change", syncInsertMonthlyHdfAvailability);
 }
@@ -584,6 +629,7 @@ function normalizeState(input) {
   settings.specialMachines = getInfectionMachineIds(settings);
   delete settings.hdfMachines;
   settings.language = normalizeLanguageCode(settings.language);
+  settings.theme = normalizeTheme(settings.theme);
 
   const patients = Array.isArray(input.patients) ? input.patients.map(normalizePatient).filter(Boolean) : [];
   const staffMembers = Array.isArray(input.staffMembers) ? input.staffMembers.map(normalizeStaffMember).filter(Boolean) : [];
@@ -647,6 +693,40 @@ function normalizePatient(patient) {
     demo: Boolean(patient.demo),
     updatedAt: patient.updatedAt || new Date().toISOString(),
   };
+}
+
+function hasPatientPlacementCriticalChanges(previousPatient, nextPatient) {
+  if (!previousPatient || !nextPatient) {
+    return true;
+  }
+  return (
+    normalizeMachineType(previousPatient.treatmentType) !== normalizeMachineType(nextPatient.treatmentType) ||
+    normalizeInfectionFlag(previousPatient.infectionFlag) !== normalizeInfectionFlag(nextPatient.infectionFlag) ||
+    normalizeCareLevel(previousPatient.careLevel) !== normalizeCareLevel(nextPatient.careLevel) ||
+    String(previousPatient.fixedMachineId || "") !== String(nextPatient.fixedMachineId || "")
+  );
+}
+
+function hasPatientSchedulePlanChanges(previousPatient, nextPatient) {
+  if (!previousPatient || !nextPatient) {
+    return false;
+  }
+  const previousDays = normalizeDayPreference(previousPatient.preferredDays).join(",");
+  const nextDays = normalizeDayPreference(nextPatient.preferredDays).join(",");
+  return (
+    hasPatientPlacementCriticalChanges(previousPatient, nextPatient) ||
+    clampNumber(previousPatient.weeklyTreatmentCount, 1, 6, 3) !== clampNumber(nextPatient.weeklyTreatmentCount, 1, 6, 3) ||
+    normalizeEvenHdfCount(previousPatient.monthlyHdfCount, 0) !== normalizeEvenHdfCount(nextPatient.monthlyHdfCount, 0) ||
+    String(previousPatient.status || "active") !== String(nextPatient.status || "active") ||
+    String(previousPatient.preferredShift || "") !== String(nextPatient.preferredShift || "") ||
+    previousDays !== nextDays ||
+    Boolean(previousPatient.forcePreferredDays) !== Boolean(nextPatient.forcePreferredDays)
+  );
+}
+
+function getPatientPlanningIndex(patientId) {
+  const index = state.patients.findIndex((patient) => patient.id === patientId);
+  return index >= 0 ? index : state.patients.length;
 }
 
 
@@ -733,12 +813,13 @@ function normalizeStaffMember(staff) {
   if (!staff || typeof staff !== "object" || !String(staff.name || "").trim()) {
     return null;
   }
+  const role = staff.role === "doctor" ? "doctor" : "nurse";
 
   return {
     id: String(staff.id || createId()),
-    name: String(staff.name || "").trim().slice(0, 32),
+    name: normalizeDemoStaffName(String(staff.name || "").trim(), role, Boolean(staff.demo)).slice(0, 32),
     code: String(staff.code || "").trim().slice(0, 32),
-    role: staff.role === "doctor" ? "doctor" : "nurse",
+    role,
     phone: String(staff.phone || "").trim().slice(0, 32),
     preferredShift: ["morning", "afternoon"].includes(staff.preferredShift) ? staff.preferredShift : "",
     status: staff.status === "paused" ? "paused" : "active",
@@ -746,6 +827,20 @@ function normalizeStaffMember(staff) {
     demo: Boolean(staff.demo),
     updatedAt: staff.updatedAt || new Date().toISOString(),
   };
+}
+
+function normalizeDemoStaffName(name, role, isDemo = false) {
+  const rawName = String(name || "").trim();
+  if (!isDemo) {
+    return rawName;
+  }
+  const roleShort = role === "doctor" ? "医" : "护";
+  const suffixPattern = /[（(](医|护)[）)]$/;
+  const withoutOldSuffix = rawName.replace(suffixPattern, "");
+  const withoutOldPrefix = withoutOldSuffix.startsWith(roleShort) && withoutOldSuffix.length > 1
+    ? withoutOldSuffix.slice(1)
+    : withoutOldSuffix;
+  return `${withoutOldPrefix || rawName}（${roleShort}）`;
 }
 
 function normalizeDayPreference(value) {
@@ -872,9 +967,37 @@ function normalizeStaffScheduleDay(daySchedule, nurseCount) {
       doctors: normalizeStaffNameArray(shiftSchedule.doctors, DOCTOR_COUNT),
       nurses: normalizeStaffNameArray(shiftSchedule.nurses, nurseCount),
       backupNurse: sanitizeStaffName(shiftSchedule.backupNurse),
+      swapNotes: normalizeStaffSwapNotes(shiftSchedule.swapNotes, nurseCount),
     };
     return result;
   }, {});
+}
+
+function normalizeStaffSwapNotes(value, nurseCount) {
+  const notes = value && typeof value === "object" ? value : {};
+  return {
+    nurses: Array.from({ length: nurseCount }, (_, index) => normalizeStaffSwapNote(notes.nurses?.[index])),
+    backupNurse: normalizeStaffSwapNote(notes.backupNurse),
+  };
+}
+
+function normalizeStaffSwapNote(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const type = value.type === "payback" ? "payback" : value.type === "cover" ? "cover" : "";
+  const partnerId = sanitizeStaffName(value.partnerId);
+  if (!type || !partnerId) {
+    return null;
+  }
+  return {
+    type,
+    partnerId,
+    group: clampNumber(value.group, 1, 999, 1),
+    relatedDateValue: /^\d{4}-\d{2}-\d{2}$/.test(String(value.relatedDateValue || "")) ? String(value.relatedDateValue) : "",
+    relatedShift: STAFF_SHIFT_KEYS.includes(value.relatedShift) ? value.relatedShift : "",
+    text: String(value.text || "").trim().slice(0, 80),
+  };
 }
 
 function normalizeStaffNameArray(value, count) {
@@ -886,6 +1009,54 @@ function sanitizeStaffName(value) {
   return String(value || "").trim().slice(0, 32);
 }
 
+function getStaffSwapNoteFromShift(shiftSchedule = {}, role, index = -1) {
+  const notes = shiftSchedule?.swapNotes || {};
+  if (role === "backupNurse") {
+    return normalizeStaffSwapNote(notes.backupNurse);
+  }
+  if (role === "nurse") {
+    return normalizeStaffSwapNote(notes.nurses?.[index]);
+  }
+  return null;
+}
+
+function setStaffSwapNote(daySchedule, shift, role, index, note) {
+  if (!daySchedule?.[shift]) {
+    return;
+  }
+  daySchedule[shift].swapNotes ||= normalizeStaffSwapNotes(daySchedule[shift].swapNotes, daySchedule[shift].nurses?.length || 0);
+  if (role === "backupNurse") {
+    daySchedule[shift].swapNotes.backupNurse = normalizeStaffSwapNote(note);
+    return;
+  }
+  if (role === "nurse" && index >= 0) {
+    daySchedule[shift].swapNotes.nurses ||= [];
+    daySchedule[shift].swapNotes.nurses[index] = normalizeStaffSwapNote(note);
+  }
+}
+
+function clearStaffSwapNote(daySchedule, shift, role, index) {
+  setStaffSwapNote(daySchedule, shift, role, index, null);
+}
+
+function formatStaffSwapNote(note, mode = "short") {
+  const normalized = normalizeStaffSwapNote(note);
+  if (!normalized) {
+    return "";
+  }
+  const partnerName = getStaffDisplayName(normalized.partnerId);
+  const groupText = normalized.group ? `第${normalized.group}组` : "调班";
+  if (mode === "long") {
+    const related = normalized.relatedDateValue
+      ? `，对应${formatDateLabel(normalized.relatedDateValue)}${normalized.relatedShift ? SHIFT_LABELS[normalized.relatedShift] : ""}`
+      : "";
+    return normalized.type === "payback"
+      ? `${groupText}：补回 ${partnerName} 的班${related}`
+      : `${groupText}：替 ${partnerName} 上班${related ? `；${partnerName}后续补回${related.replace(/^，对应/, "")}` : ""}`;
+  }
+  return normalized.type === "payback" ? `补回${partnerName} · ${groupText}` : `替${partnerName} · ${groupText}`;
+}
+
 function saveState() {
   pruneEmptyStaffSchedules();
   pruneInvalidMachineSettings();
@@ -895,6 +1066,7 @@ function saveState() {
     if (ui.storageStatus) {
       ui.storageStatus.textContent = `${savedText} ${new Date().toLocaleTimeString(getLanguageMeta().code, { hour12: false })}`;
     }
+    updateUndoButton();
     return true;
   } catch (error) {
     console.error("Failed to save scheduler state", error);
@@ -904,6 +1076,77 @@ function saveState() {
     showToast(!isChineseLanguage() ? "Local save failed. Export a backup now." : "本地保存失败，请立即导出 JSON 备份");
     return false;
   }
+}
+
+function getUndoHistory() {
+  try {
+    const raw = localStorage.getItem(UNDO_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((item) => item?.state) : [];
+  } catch (error) {
+    console.warn("Failed to read undo history", error);
+    return [];
+  }
+}
+
+function setUndoHistory(history = []) {
+  try {
+    localStorage.setItem(UNDO_STORAGE_KEY, JSON.stringify(history.slice(0, MAX_UNDO_SNAPSHOTS)));
+  } catch (error) {
+    console.warn("Failed to save undo history", error);
+  }
+  updateUndoButton();
+}
+
+function captureUndoSnapshot(label) {
+  try {
+    const snapshot = {
+      id: createId(),
+      label: String(label || "上一步操作").slice(0, 80),
+      createdAt: new Date().toISOString(),
+      state: structuredClone(state),
+    };
+    const history = getUndoHistory();
+    history.unshift(snapshot);
+    setUndoHistory(history);
+    return true;
+  } catch (error) {
+    console.warn("Failed to capture undo snapshot", error);
+    return false;
+  }
+}
+
+function updateUndoButton() {
+  if (!ui.undoLastChange) return;
+  const latest = getUndoHistory()[0];
+  ui.undoLastChange.disabled = !latest;
+  ui.undoLastChange.textContent = latest ? `撤销：${latest.label}` : "撤销上一步";
+  ui.undoLastChange.title = latest
+    ? `恢复到“${latest.label}”之前的状态`
+    : "关键改动前会自动生成一个可撤销快照";
+}
+
+function restoreLastUndoSnapshot() {
+  const history = getUndoHistory();
+  const latest = history.shift();
+  if (!latest?.state) {
+    updateUndoButton();
+    showToast("目前没有可撤销的操作");
+    return;
+  }
+  if (!window.confirm(`确定撤销“${latest.label}”吗？当前排班会恢复到这一步之前。`)) {
+    return;
+  }
+  const restored = normalizeState(latest.state);
+  Object.keys(state).forEach((key) => delete state[key]);
+  Object.assign(state, restored);
+  pendingTwoWeekPlan = null;
+  setUndoHistory(history);
+  saveState();
+  syncActiveCycleWeekFromDate();
+  syncCycleWeekToWeeklyView();
+  renderAll();
+  showToast(`已撤销：${latest.label}`);
 }
 
 function pruneEmptyStaffSchedules() {
@@ -941,6 +1184,7 @@ function pruneInvalidMachineSettings() {
   state.settings.inactiveSlots = normalizeInactiveSlots(state.settings.inactiveSlots, state.settings);
   state.settings.pausedMachines = normalizeMachineIdList(state.settings.pausedMachines, new Set(getMachineIds()));
   state.settings.schedulePriority = normalizeSchedulePriority(state.settings.schedulePriority);
+  state.settings.theme = normalizeTheme(state.settings.theme);
   state.settings.machineTypes = normalizeMachineTypeMap(state.settings.machineTypes, new Set(getMachineIds()), state.settings.hdfMachines);
   state.settings.machineZones = normalizeMachineZoneMap(state.settings.machineZones, new Set(getMachineIds()), state.settings.specialMachines);
   state.settings.specialMachines = getInfectionMachineIds(state.settings);
@@ -1106,6 +1350,7 @@ function ensureDate() {
 }
 
 function renderAll() {
+  renderTheme();
   renderSettingsForm();
   renderHeader();
   renderWeekNavigation();
@@ -1117,6 +1362,7 @@ function renderAll() {
   renderLayoutPreviewFromForm();
   renderLanguage();
   syncMonthlyHdfAvailability();
+  updateUndoButton();
 }
 
 function renderHeader() {
@@ -1535,15 +1781,31 @@ function findCompatibleHdfMachineForAssignment(week, dayKey, shift, patient, pre
   return candidates.find((machineId) => !week?.[dayKey]?.[machineId]?.[shift]) || "";
 }
 
+function estimateNurseDutyCountForPatientSchedules(patientSchedules = {}) {
+  return WORKING_DAY_KEYS.reduce((total, dayKey) => {
+    const patientDaySchedule = patientSchedules?.[dayKey] || {};
+    return total + STAFF_SHIFT_KEYS.reduce((shiftTotal, shift) => {
+      const patientCount = countAssigned(patientDaySchedule, getMachineIds(), shift);
+      return patientCount
+        ? shiftTotal + getRequiredNurseCountForShift(patientDaySchedule, shift) + BACKUP_NURSE_COUNT
+        : shiftTotal;
+    }, 0);
+  }, 0);
+}
+
 function buildTwoWeekStaffSchedules(patientResult) {
   const weekResults = {};
   const warnings = [];
   const blocking = [];
   const doctors = state.staffMembers.filter((staff) => staff.role === "doctor" && staff.status === "active");
   const nurses = state.staffMembers.filter((staff) => staff.role === "nurse" && staff.status === "active");
+  const estimatedTwoWeekNurseDutyCount =
+    estimateNurseDutyCountForPatientSchedules(patientResult.week1) +
+    estimateNurseDutyCountForPatientSchedules(patientResult.week2);
   const balancingContext = {
     assignmentCounts: new Map([...doctors, ...nurses].map((staff) => [staff.id, 0])),
     nurseWorkedDays: new Map(nurses.map((staff) => [staff.id, new Set()])),
+    estimatedTotalNurseDutyCount: estimatedTwoWeekNurseDutyCount,
   };
 
   for (const [weekKey, weekSchedules] of Object.entries({
@@ -1609,6 +1871,7 @@ function buildTwoWeekReview(patientResult, staffResult) {
     .filter((staff) => staff.status === "active")
     .map((staff) => {
       const duties = [];
+      const swapOuts = [];
       for (const [weekNumber, staffWeek, patientWeek] of [
         [1, staffResult.week1, patientResult.week1],
         [2, staffResult.week2, patientResult.week2],
@@ -1616,13 +1879,13 @@ function buildTwoWeekReview(patientResult, staffResult) {
         for (const dayKey of WORKING_DAY_KEYS) {
           for (const shift of STAFF_SHIFT_KEYS) {
             const entry = staffWeek?.[dayKey]?.[shift] || {};
+            const groups = getNurseGroupsForShift(patientWeek?.[dayKey] || {}, shift, state.settings)
+              .filter((group) => group && !group.empty);
             if ((entry.doctors || []).includes(staff.id)) {
               duties.push({ weekNumber, dayKey, shift, role: "医生" });
             }
             const nurseIndex = (entry.nurses || []).indexOf(staff.id);
             if (nurseIndex >= 0) {
-              const groups = getNurseGroupsForShift(patientWeek?.[dayKey] || {}, shift, state.settings)
-                .filter((group) => group && !group.empty);
               const group = groups[nurseIndex];
               const zoneLabel = getNurseGroupReviewLabel(group);
               duties.push({
@@ -1630,10 +1893,44 @@ function buildTwoWeekReview(patientResult, staffResult) {
                 dayKey,
                 shift,
                 role: zoneLabel ? `负责：${zoneLabel}` : `责任护士${nurseIndex + 1}`,
+                swapNote: getStaffSwapNoteFromShift(entry, "nurse", nurseIndex),
               });
             }
+            (entry.nurses || []).forEach((assignedStaffId, nurseNoteIndex) => {
+              const note = getStaffSwapNoteFromShift(entry, "nurse", nurseNoteIndex);
+              if (note?.type !== "cover" || note.partnerId !== staff.id) {
+                return;
+              }
+              const group = groups[nurseNoteIndex];
+              const zoneLabel = getNurseGroupReviewLabel(group);
+              swapOuts.push({
+                weekNumber,
+                dayKey,
+                shift,
+                role: zoneLabel ? `负责：${zoneLabel}` : `责任护士${nurseNoteIndex + 1}`,
+                covererId: assignedStaffId,
+                swapNote: note,
+              });
+            });
             if (entry.backupNurse === staff.id) {
-              duties.push({ weekNumber, dayKey, shift, role: "后备护士" });
+              duties.push({
+                weekNumber,
+                dayKey,
+                shift,
+                role: "后备护士",
+                swapNote: getStaffSwapNoteFromShift(entry, "backupNurse", -1),
+              });
+            }
+            const backupSwapNote = getStaffSwapNoteFromShift(entry, "backupNurse", -1);
+            if (backupSwapNote?.type === "cover" && backupSwapNote.partnerId === staff.id) {
+              swapOuts.push({
+                weekNumber,
+                dayKey,
+                shift,
+                role: "后备护士",
+                covererId: entry.backupNurse,
+                swapNote: backupSwapNote,
+              });
             }
           }
         }
@@ -1653,6 +1950,8 @@ function buildTwoWeekReview(patientResult, staffResult) {
         name: staff.name,
         role: staff.role,
         duties,
+        swapOuts,
+        swapStats: summarizeStaffSwapItems(duties, swapOuts),
         shiftCount: duties.length,
         workedDays,
         fullDays,
@@ -1816,6 +2115,75 @@ function updateTwoWeekProgress(percent, stage, title = "") {
   if (title && titleNode) titleNode.textContent = title;
 }
 
+function ensureTaskProgressOverlay() {
+  let overlay = document.getElementById("taskProgressOverlay");
+  if (overlay) {
+    return overlay;
+  }
+  overlay = document.createElement("div");
+  overlay.id = "taskProgressOverlay";
+  overlay.className = "task-progress-overlay";
+  overlay.hidden = true;
+  overlay.innerHTML = `
+    <section class="task-progress-panel" role="alert" aria-live="polite">
+      <div class="two-week-loading-spinner" aria-hidden="true"></div>
+      <div>
+        <h3 id="taskProgressTitle">正在处理</h3>
+        <p id="taskProgressStage">准备中</p>
+      </div>
+      <div class="task-progress-shell" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+           id="taskProgressBar">
+        <div class="task-progress-fill" id="taskProgressFill"></div>
+      </div>
+      <div class="task-progress-foot">
+        <span>任务较大时请稍等，不要重复点击。</span>
+        <strong id="taskProgressPercent">0%</strong>
+      </div>
+    </section>
+  `;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function showTaskProgress(title = "正在处理", stage = "准备中", percent = 0) {
+  const overlay = ensureTaskProgressOverlay();
+  overlay.hidden = false;
+  updateTaskProgress(percent, stage, title);
+}
+
+function updateTaskProgress(percent, stage = "", title = "") {
+  const overlay = ensureTaskProgressOverlay();
+  const safePercent = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const titleNode = document.getElementById("taskProgressTitle");
+  const stageNode = document.getElementById("taskProgressStage");
+  const bar = document.getElementById("taskProgressBar");
+  const fill = document.getElementById("taskProgressFill");
+  const percentNode = document.getElementById("taskProgressPercent");
+  if (title && titleNode) titleNode.textContent = title;
+  if (stageNode) stageNode.textContent = stage || "";
+  if (bar) bar.setAttribute("aria-valuenow", String(safePercent));
+  if (fill) fill.style.width = `${safePercent}%`;
+  if (percentNode) percentNode.textContent = `${safePercent}%`;
+  overlay.hidden = false;
+}
+
+async function stepTaskProgress(percent, stage, title = "") {
+  updateTaskProgress(percent, stage, title);
+  await waitForBrowserPaint();
+}
+
+async function closeTaskProgress(finalStage = "完成", delay = 120) {
+  const overlay = document.getElementById("taskProgressOverlay");
+  if (!overlay) return;
+  updateTaskProgress(100, finalStage);
+  await waitForBrowserPaint();
+  if (delay) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  overlay.hidden = true;
+}
+
 function formatTwoWeekBlockingErrors(items, limit = 24) {
   const unique = [...new Set((items || []).filter(Boolean).map(String))];
   const visible = unique.slice(0, limit);
@@ -1926,7 +2294,7 @@ async function generateTwoWeekPlan() {
       return;
     }
 
-    saveTwoWeekCycleTemplate();
+    await saveTwoWeekCycleTemplate();
   } catch (error) {
     showTwoWeekGenerationError(error, "生成2周排班失败");
   } finally {
@@ -1934,8 +2302,15 @@ async function generateTwoWeekPlan() {
   }
 }
 
-function saveTwoWeekCycleTemplate() {
+async function saveTwoWeekCycleTemplate({ showProgress = true } = {}) {
+  if (showProgress) {
+    showTaskProgress("正在保存长期2周循环模板", "准备保存排班数据", 5);
+    await waitForBrowserPaint();
+  }
+  let undoCaptured = false;
   if (pendingTwoWeekPlan) {
+    if (showProgress) await stepTaskProgress(18, "保存患者、医护和报告模板");
+    undoCaptured = captureUndoSnapshot("保存长期2周循环模板");
     state.twoWeekCycle = {
       patientSchedules: structuredClone(pendingTwoWeekPlan.patientSchedules),
       staffSchedules: structuredClone(pendingTwoWeekPlan.staffSchedules),
@@ -1944,6 +2319,7 @@ function saveTwoWeekCycleTemplate() {
       anchorWeekStart: formatDateInput(getWeekStart(parseDateInput(getCurrentDate()))),
     };
     const fixedAt = new Date().toISOString();
+    if (showProgress) await stepTaskProgress(45, "固定首次自动分配的机位");
     Object.entries(pendingTwoWeekPlan.fixedMachineAssignments || {}).forEach(([patientId, machineId]) => {
       const patient = findPatient(patientId);
       if (patient && !patient.fixedMachineId && machineId) {
@@ -1953,14 +2329,18 @@ function saveTwoWeekCycleTemplate() {
       }
     });
   } else {
+    if (showProgress) await stepTaskProgress(18, "读取当前正在编辑的2周排班");
     copyWeeklyViewBackToCycle();
     const hasAnyPlan = ["week1", "week2"].some((weekKey) =>
       Object.keys(state.twoWeekCycle?.patientSchedules?.[weekKey] || {}).length,
     );
     if (!hasAnyPlan) {
+      if (showProgress) await closeTaskProgress("没有可保存的2周排班", 0);
       window.alert("当前没有可保存的2周排班，请先生成2周排班。");
       return;
     }
+    if (showProgress) await stepTaskProgress(45, "重新整理当前2周报告");
+    undoCaptured = captureUndoSnapshot("保存长期2周循环模板");
     const currentReview = buildCurrentTwoWeekReview();
     if (currentReview) {
       state.twoWeekCycle.review = structuredClone(currentReview);
@@ -1968,10 +2348,16 @@ function saveTwoWeekCycleTemplate() {
     state.twoWeekCycle.anchorWeekStart = state.twoWeekCycle.anchorWeekStart || getAnchorWeekStartForActiveCycle();
     state.twoWeekCycle.savedAt = new Date().toISOString();
   }
+  if (!undoCaptured) {
+    captureUndoSnapshot("保存长期2周循环模板");
+  }
+  if (showProgress) await stepTaskProgress(70, "写入本地保存数据");
   saveState();
   pendingTwoWeekPlan = null;
+  if (showProgress) await stepTaskProgress(85, "刷新本周和下周视图");
   syncCycleWeekToWeeklyView();
   refreshScheduleView();
+  if (showProgress) await closeTaskProgress("长期2周循环模板已保存");
   showToast("长期2周循环模板已保存：第1周 → 第2周 → 第1周持续循环");
 }
 
@@ -2008,24 +2394,235 @@ function buildCurrentTwoWeekReview() {
   return buildTwoWeekReview(patientResult, staffResult);
 }
 
-function openStoredTwoWeekReview() {
+async function openStoredTwoWeekReview() {
   if (ui.openTwoWeekReview.disabled) {
     return;
   }
 
   ui.openTwoWeekReview.disabled = true;
+  showTaskProgress("正在生成当前2周排班报告", "读取当前2周循环数据", 8);
+  await waitForBrowserPaint();
   try {
+    await stepTaskProgress(30, "整理患者、机位和医护明细");
     const review = buildCurrentTwoWeekReview();
     if (!review) {
+      await closeTaskProgress("没有可生成报告的数据", 0);
       window.alert("当前没有可生成报告的2周排班，请先生成或手动保存2周排班。");
       return;
     }
+    await stepTaskProgress(72, "生成护士长结论和复核表格");
     showTwoWeekReview({ review }, false, "当前排班报告");
+    await closeTaskProgress("当前2周报告已生成", 80);
   } catch (error) {
+    await closeTaskProgress("生成报告失败", 0);
     showTwoWeekGenerationError(error, "生成当前2周排班报告失败");
   } finally {
     ui.openTwoWeekReview.disabled = false;
   }
+}
+
+async function runScheduleSelfCheck() {
+  if (ui.runScheduleSelfCheck.disabled) {
+    return;
+  }
+
+  ui.runScheduleSelfCheck.disabled = true;
+  showTaskProgress("正在执行排班自检", "读取当前2周排班", 8);
+  await waitForBrowserPaint();
+  try {
+    await stepTaskProgress(28, "检查患者治疗、血滤和机器分区");
+    const review = buildCurrentTwoWeekReview();
+    if (!review) {
+      await closeTaskProgress("没有可自检的数据", 0);
+      window.alert("当前没有可自检的2周排班，请先生成或保存2周排班。");
+      return;
+    }
+    await stepTaskProgress(58, "检查强制个性化、医护休息和跨年滚动");
+    const selfCheck = buildScheduleSelfCheck(review);
+    await stepTaskProgress(82, "生成护士长可读结论");
+    showTwoWeekReview({ review }, false, "一键自检");
+    ui.twoWeekReviewTitle.textContent = selfCheck.title;
+    ui.twoWeekReviewMeta.innerHTML = renderSelfCheckMeta(selfCheck);
+    ui.twoWeekReviewContent.innerHTML = `${renderSelfCheckSummary(selfCheck)}${ui.twoWeekReviewContent.innerHTML}`;
+    await closeTaskProgress("排班自检完成", 80);
+  } catch (error) {
+    await closeTaskProgress("排班自检失败", 0);
+    showTwoWeekGenerationError(error, "排班自检失败");
+  } finally {
+    ui.runScheduleSelfCheck.disabled = false;
+  }
+}
+
+function buildScheduleSelfCheck(review) {
+  const scheduledPatients = review.patientRows.filter((row) => row.sessions.length > 0).length;
+  const hdfMatched = review.stats.hdfTargetCount === review.stats.hdfActualCount;
+  const assessment = buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched);
+  const safety = collectCurrentTwoWeekSafetyFindings();
+  const forcePreferredWarnings = collectForcedPreferredDayWarnings(review);
+  const staffWarnings = collectStaffRestWarnings(review);
+  const crossYear = buildCrossYearCycleCheck();
+  const blocking = dedupeMessages([...(review.blocking || []), ...safety.errors]);
+  const warnings = dedupeMessages([
+    ...(review.warnings || []),
+    ...safety.warnings,
+    ...forcePreferredWarnings,
+    ...staffWarnings,
+  ]);
+  const tone = blocking.length ? "danger" : warnings.length ? "warning" : "ok";
+  const title = tone === "danger"
+    ? "自检结论：暂时不能长期运行"
+    : tone === "warning"
+      ? "自检结论：可以运行，但护士长需要先复核"
+      : "自检结论：可以长期2周循环运行";
+  const detail = tone === "danger"
+    ? "系统发现会影响安全保存或长期循环的问题，请先处理红色阻止项。"
+    : tone === "warning"
+      ? "患者治疗和机器安全没有阻止项，但有提醒项，建议护士长确认后再长期使用。"
+      : "患者治疗、血滤目标、机器分区、医护排班和日期滚动均通过本次检查。";
+  return {
+    tone,
+    title,
+    detail,
+    blocking,
+    warnings,
+    assessment,
+    crossYear,
+    cards: [
+      {
+        label: "患者治疗",
+        value: `${review.stats.treatmentCount}/${review.stats.expectedTreatmentCount || review.stats.treatmentCount}`,
+        detail: `${scheduledPatients}/${review.stats.patientCount}名患者已排入`,
+        tone: assessment.checks[0]?.tone || "ok",
+      },
+      {
+        label: "血滤目标",
+        value: `${review.stats.hdfActualCount}/${review.stats.hdfTargetCount}`,
+        detail: hdfMatched ? "次数一致" : "需要复核",
+        tone: hdfMatched ? "ok" : "warning",
+      },
+      {
+        label: "安全校验",
+        value: blocking.length ? `${blocking.length}项阻止` : "通过",
+        detail: blocking.length ? "先处理红色问题" : "机器、分区、医护引用无阻止项",
+        tone: blocking.length ? "danger" : "ok",
+      },
+      {
+        label: "运行提醒",
+        value: warnings.length ? `${warnings.length}项提醒` : "无提醒",
+        detail: warnings.length ? "建议护士长复核" : "未发现额外提醒",
+        tone: warnings.length ? "warning" : "ok",
+      },
+      {
+        label: "跨年滚动",
+        value: crossYear.ok ? "通过" : "需复核",
+        detail: crossYear.detail,
+        tone: crossYear.ok ? "ok" : "warning",
+      },
+    ],
+  };
+}
+
+function collectCurrentTwoWeekSafetyFindings() {
+  const patientWeek1 = structuredClone(state.twoWeekCycle?.patientSchedules?.week1 || {});
+  const patientWeek2 = structuredClone(state.twoWeekCycle?.patientSchedules?.week2 || {});
+  const staffWeek1 = structuredClone(state.twoWeekCycle?.staffSchedules?.week1 || {});
+  const staffWeek2 = structuredClone(state.twoWeekCycle?.staffSchedules?.week2 || {});
+  const errors = [
+    ...validateGeneratedWeeklySafety(patientWeek1, staffWeek1).map((item) => `第1周：${item}`),
+    ...validateGeneratedWeeklySafety(patientWeek2, staffWeek2).map((item) => `第2周：${item}`),
+  ];
+  return { errors: dedupeMessages(errors), warnings: [] };
+}
+
+function collectForcedPreferredDayWarnings(review) {
+  return (review.patientRows || []).flatMap((row) => {
+    const patient = findPatient(row.patientId);
+    if (!patient?.forcePreferredDays) return [];
+    const allowed = new Set((patient.preferredDays || []).map(String).filter((dayKey) => WORKING_DAY_KEYS.includes(dayKey)));
+    if (!allowed.size) {
+      return [`${row.name} 已开启强制个性化，但没有勾选可用的星期几。`];
+    }
+    const moved = row.sessions.filter((session) => !allowed.has(String(session.dayKey)));
+    if (!moved.length) return [];
+    const detail = moved
+      .map((session) => `第${session.weekNumber}周${getWeekDayLabel(session.dayKey)}${SHIFT_LABELS[session.shift]}${session.machineId}号机`)
+      .join("、");
+    return [`${row.name} 已开启强制个性化，但仍被排到非勾选日期：${detail}。`];
+  });
+}
+
+function collectStaffRestWarnings(review) {
+  const rows = (review.staffRows || []).filter((row) => row.shiftCount > 0);
+  if (!rows.length) {
+    return ["最近2周没有医护排班，请补全医护后再长期运行。"];
+  }
+  const minRest = Math.min(...rows.map((row) => row.restDays));
+  if (minRest <= 2) {
+    const names = rows.filter((row) => row.restDays === minRest).map((row) => row.name).slice(0, 6).join("、");
+    return [`医护完整休息日偏少：${names} 最近2周只有${minRest}天完整休息。`];
+  }
+  return [];
+}
+
+function buildCrossYearCycleCheck() {
+  try {
+    const currentYear = new Date().getFullYear();
+    const weekStart = getWeekStart(new Date(currentYear, 11, 29));
+    const first = formatDateInput(weekStart);
+    const last = formatDateInput(addDays(weekStart, 13));
+    const includesYearChange = first.slice(0, 4) !== last.slice(0, 4);
+    const labels = [0, 7, 13].map((offset) => formatDateLabel(formatDateInput(addDays(weekStart, offset))));
+    return {
+      ok: includesYearChange && labels.length === 3,
+      detail: `${labels[0]}到${labels[2]}可连续显示`,
+    };
+  } catch (error) {
+    return { ok: false, detail: "跨年日期预览失败，请人工复核" };
+  }
+}
+
+function renderSelfCheckMeta(selfCheck) {
+  const chips = [
+    '<span class="two-week-review-meta-label">一键自检</span>',
+    `<span class="two-week-review-chip ${escapeHtml(selfCheck.tone)}">${escapeHtml(selfCheck.title.replace("自检结论：", ""))}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.blocking.length ? "danger" : "ok"}">${escapeHtml(selfCheck.blocking.length ? `${selfCheck.blocking.length}项阻止` : "无阻止项")}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.warnings.length ? "warning" : "ok"}">${escapeHtml(selfCheck.warnings.length ? `${selfCheck.warnings.length}项提醒` : "无提醒")}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.crossYear.ok ? "ok" : "warning"}">${escapeHtml(selfCheck.crossYear.ok ? "跨年通过" : "跨年需复核")}</span>`,
+  ];
+  return chips.join("");
+}
+
+function renderSelfCheckSummary(selfCheck) {
+  const problemItems = [
+    ...selfCheck.blocking.map((item) => ({ tone: "danger", label: "阻止", text: item })),
+    ...selfCheck.warnings.map((item) => ({ tone: "warning", label: "提醒", text: item })),
+  ];
+  return `
+    <section class="self-check-summary ${escapeHtml(selfCheck.tone)}">
+      <div class="self-check-heading">
+        <span>护士长建议</span>
+        <h3>${escapeHtml(selfCheck.title)}</h3>
+        <p>${escapeHtml(selfCheck.detail)}</p>
+      </div>
+      <div class="self-check-card-grid">
+        ${selfCheck.cards.map((card) => `
+          <article class="${escapeHtml(card.tone || "ok")}">
+            <span>${escapeHtml(card.label)}</span>
+            <strong>${escapeHtml(card.value)}</strong>
+            <em>${escapeHtml(card.detail)}</em>
+          </article>
+        `).join("")}
+      </div>
+      <div class="self-check-problems">
+        ${problemItems.length
+          ? problemItems.slice(0, 12).map((item) => `
+            <p class="${escapeHtml(item.tone)}"><b>${escapeHtml(item.label)}</b>${escapeHtml(item.text)}</p>
+          `).join("")
+          : `<p class="ok"><b>通过</b>没有发现需要提前处理的问题。</p>`}
+        ${problemItems.length > 12 ? `<p class="warning"><b>提醒</b>还有${escapeHtml(problemItems.length - 12)}项未显示，请看下方报告明细。</p>` : ""}
+      </div>
+    </section>
+  `;
 }
 
 function showTwoWeekReview(plan, confirmMode = false, sourceLabel = "全新自动重排") {
@@ -2326,7 +2923,7 @@ function handleTwoWeekReviewContentClick(event) {
   applyCurrentTwoWeekCycleFromReview();
 }
 
-function applyCurrentTwoWeekCycleFromReview() {
+async function applyCurrentTwoWeekCycleFromReview() {
   const review = buildCurrentTwoWeekReview();
   if (!review) {
     window.alert("当前没有可应用的2周排班，请先生成2周排班。");
@@ -2337,13 +2934,13 @@ function applyCurrentTwoWeekCycleFromReview() {
     window.alert("当前2周排班还有硬性问题，暂不能应用为长期循环。请先处理阻止项。");
     return;
   }
-  saveTwoWeekCycleTemplate();
+  await saveTwoWeekCycleTemplate();
   if (ui.twoWeekReviewDialog.open) {
     ui.twoWeekReviewDialog.close();
   }
 }
 
-function buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched) {
+function buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched, strategyRestComparisonOverride = null) {
   const expectedTreatmentCount = review.stats.expectedTreatmentCount || review.stats.treatmentCount;
   const twoWeekWorkingDays = WORKING_DAY_KEYS.length * 2;
   const twoWeekHalfDaySlots = twoWeekWorkingDays * STAFF_SHIFT_KEYS.length;
@@ -2375,7 +2972,7 @@ function buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched) {
   const hasWarnings = Boolean(review.warnings?.length);
   const hasStaffLoadWarning = staffWithDuties.length > 0 && minRestDays < 2;
   const needsNurseManagerReview = hasWarnings || hasStaffLoadWarning;
-  const strategyRestComparison = buildTwoWeekStrategyRestComparison();
+  const strategyRestComparison = strategyRestComparisonOverride || review?.strategyRestComparison || buildTwoWeekStrategyRestComparison();
 
   let tone = "ok";
   let title = "可以作为长期2周循环运行";
@@ -2758,7 +3355,7 @@ function simplifyTwoWeekReviewIssue(message, review = null) {
   }
 
   if (text.includes("医护排班采用休息最大化")) {
-    return plain(`${weekLabel ? `${weekLabel}：` : ""}医护按休息最大化安排，会优先让同一批护士上整日班，把休息尽量留成完整一天；请护士长复核个别人班次是否偏多。`);
+    return plain(`${weekLabel ? `${weekLabel}：` : ""}医护按休息最大化安排，会优先形成整日班，同时尽量把半日班分摊到所有在岗护士，避免少数人天天上班。`);
   }
 
   if (text.includes("未设置星期，已按每周")) {
@@ -3134,32 +3731,287 @@ function countAssigned(daySchedule, machines, shift) {
   return machines.filter((machineId) => daySchedule[machineId]?.[shift]?.patientId).length;
 }
 
+function countStaffWorkingForShift(staffDaySchedule = {}, shift) {
+  const shiftSchedule = staffDaySchedule?.[shift] || {};
+  return new Set([
+    ...(shiftSchedule.doctors || []).filter(isStaffScheduleValueFilled),
+    ...(shiftSchedule.nurses || []).filter(isStaffScheduleValueFilled),
+    ...(isStaffScheduleValueFilled(shiftSchedule.backupNurse) ? [shiftSchedule.backupNurse] : []),
+  ]).size;
+}
+
 function renderStaffSchedule() {
+  const overview = buildStaffTwoWeekOverview();
+  const scopeControl = ui.staffScheduleScope?.closest(".scope-control");
+  if (scopeControl) {
+    scopeControl.hidden = true;
+  }
+  ui.staffTitle.textContent = "最近2周医护工作与休息";
+  ui.staffMeta.textContent = `${overview.rangeText} · 半天班按1个半日班统计，上午+下午同一天算1个工作日`;
+  ui.staffScheduleGrid.innerHTML = renderStaffTwoWeekOverview(overview);
+}
+
+function buildStaffTwoWeekOverview() {
   const date = getCurrentDate();
-  const patientDaySchedule = getEffectiveScheduleForDate(date);
-  const baseProfile = getNurseGroupProfileForDay(patientDaySchedule);
-  const nurseCount = Math.max(baseProfile.count, getExistingStaffNurseSlotCount(date), 1);
-  const nurseProfile = getNurseGroupProfileForDay(patientDaySchedule, state.settings, nurseCount);
-  const daySchedule = getEffectiveStaffScheduleForDate(date, nurseCount);
-  const shiftRequirements = STAFF_SHIFT_KEYS.map((shift) => {
-    const patientCount = countAssigned(patientDaySchedule, getMachineIds(), shift);
-    const requiredGroups = (nurseProfile.shiftGroups[shift] || []).filter((group) => !group.empty);
-    const required = patientCount ? DOCTOR_COUNT + requiredGroups.length + BACKUP_NURSE_COUNT : 0;
-    return { shift, patientCount, requiredGroups, required };
-  });
+  const currentWeekStart = getWeekStart(parseDateInput(date));
+  const hasCycle = hasTwoWeekCycleTemplate();
+  const week1Actual = buildActualWeekSchedulesForOverview(currentWeekStart);
+  const week2Actual = buildActualWeekSchedulesForOverview(addDays(currentWeekStart, 7));
+  const review = buildTwoWeekReview(
+    { week1: week1Actual.patientWeek, week2: week2Actual.patientWeek, warnings: [], blocking: [] },
+    { week1: week1Actual.staffWeek, week2: week2Actual.staffWeek, warnings: [], blocking: [] },
+  );
+  const week1Start = currentWeekStart;
+  const week2Start = addDays(currentWeekStart, 7);
+  return {
+    review,
+    hasCycle,
+    weekLabels: ["本周", "下周"],
+    rangeText: `${formatShortDate(week1Start)}-${formatShortDate(addDays(week2Start, 5))}`,
+  };
+}
 
-  ui.staffTitle.textContent = !isChineseLanguage() ? `${formatDateLabel(date)} Staff Schedule` : `${formatDateLabel(date)}医护排班`;
-  const activeRequirements = shiftRequirements.filter((item) => item.patientCount > 0);
-  ui.staffMeta.textContent = activeRequirements.length
-    ? `${activeRequirements.map((item) => `${SHIFT_LABELS[item.shift]} ${item.required} 岗`).join(" · ")} · 重病区 5 人/护士，其他区 6 人/护士，每名护士最多 1 台血滤机`
-    : "当前日期没有患者，本日无需安排医护";
-  ui.staffScheduleGrid.innerHTML = shiftRequirements
-    .map(({ shift, patientCount, requiredGroups }) => renderStaffShiftCard(shift, daySchedule[shift], requiredGroups, date, patientCount))
-    .join("");
-
-  ui.staffScheduleGrid.querySelectorAll("[data-staff-role]").forEach((input) => {
-    input.addEventListener("change", saveStaffInput);
+function buildActualWeekSchedulesForOverview(weekStart) {
+  const patientWeek = {};
+  const staffWeek = {};
+  WORKING_DAY_KEYS.forEach((dayKey) => {
+    const dateValue = formatDateInput(addDays(weekStart, Number(dayKey) - 1));
+    const patientDay = getEffectivePatientScheduleForOverviewDate(dateValue);
+    const nurseCount = Math.max(
+      getNurseGroupProfileForDay(patientDay, state.settings).count,
+      getExistingStaffNurseSlotCount(dateValue),
+      1,
+    );
+    patientWeek[dayKey] = patientDay;
+    staffWeek[dayKey] = getStaffScheduleForShiftSwapDate(dateValue, nurseCount);
   });
+  return { patientWeek, staffWeek };
+}
+
+function getEffectivePatientScheduleForOverviewDate(dateValue) {
+  const dayKey = getWeekdayKey(dateValue);
+  const base = hasTwoWeekCycleTemplate()
+    ? state.twoWeekCycle?.patientSchedules?.[getCycleWeekKey(getCycleWeekNumberForDate(dateValue))]?.[dayKey] || {}
+    : state.weeklySchedules?.[dayKey] || {};
+  return mergeScheduleDays(base, state.schedules?.[dateValue] || {});
+}
+
+function renderStaffTwoWeekOverview(overview) {
+  const rows = (overview.review.staffRows || []).sort((left, right) =>
+    Number(left.role === "doctor") - Number(right.role === "doctor") ||
+    left.shiftCount - right.shiftCount ||
+    String(left.name).localeCompare(String(right.name), "zh-CN"),
+  );
+  if (!rows.length) {
+    return `
+      <section class="staff-overview-empty">
+        <strong>还没有在岗医护</strong>
+        <span>请先在下方医护库新增医生和护士，再生成或保存2周排班。</span>
+      </section>
+    `;
+  }
+
+  const advice = buildStaffTwoWeekAdvice(rows, overview);
+  const stats = buildStaffTwoWeekStats(rows);
+  return `
+    <section class="staff-overview-panel">
+      ${renderStaffOverviewAdvice(advice, stats, overview)}
+      <div class="staff-overview-card-grid">
+        ${rows.map((row) => renderStaffOverviewPersonCard(row, overview.weekLabels)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function buildStaffTwoWeekStats(rows = []) {
+  const activeRows = rows.filter((row) => row.shiftCount > 0);
+  const nurseRows = rows.filter((row) => row.role === "nurse");
+  const activeNurseRows = nurseRows.filter((row) => row.shiftCount > 0);
+  const totalHalfDayShifts = rows.reduce((sum, row) => sum + row.shiftCount, 0);
+  const totalWorkedDays = rows.reduce((sum, row) => sum + row.workedDays, 0);
+  const totalRestDays = rows.reduce((sum, row) => sum + row.restDays, 0);
+  const maxShift = activeRows.length ? Math.max(...activeRows.map((row) => row.shiftCount)) : 0;
+  const minRest = activeRows.length ? Math.min(...activeRows.map((row) => row.restDays)) : 12;
+  const busiest = activeRows.filter((row) => row.shiftCount === maxShift).map((row) => row.name).slice(0, 4);
+  return {
+    totalStaff: rows.length,
+    nurseCount: nurseRows.length,
+    activeStaff: activeRows.length,
+    activeNurses: activeNurseRows.length,
+    noDutyStaff: rows.length - activeRows.length,
+    totalHalfDayShifts,
+    totalWorkedDays,
+    totalRestDays,
+    averageHalfDayShifts: rows.length ? totalHalfDayShifts / rows.length : 0,
+    maxShift,
+    minRest,
+    busiest,
+  };
+}
+
+function buildStaffTwoWeekAdvice(rows, overview) {
+  const stats = buildStaffTwoWeekStats(rows);
+  if (!stats.totalHalfDayShifts) {
+    return {
+      tone: "warning",
+      title: "护士长建议：最近2周还没有医护排班",
+      detail: "请先生成或保存2周排班；保存后这里会按每个医护显示工作天数、休息天数和半日班数量。",
+    };
+  }
+  if (stats.minRest <= 2) {
+    return {
+      tone: "warning",
+      title: "护士长建议：先复核休息偏少人员",
+      detail: `最近2周最少只有${stats.minRest}天完整休息；半日班最多${stats.maxShift}个，重点看${stats.busiest.join("、") || "高负荷人员"}是否需要调整。`,
+    };
+  }
+  if (stats.noDutyStaff > 0) {
+    return {
+      tone: "ok",
+      title: "护士长建议：可以运行，但要确认无班人员安排",
+      detail: `最近2周共有${stats.noDutyStaff}名医护没有排班；如果这是计划内休息可以保留，否则请在下方医护资料或2周排班里复核。`,
+    };
+  }
+  return {
+    tone: "ok",
+    title: "护士长建议：最近2周医护负担基本可读",
+    detail: `共${stats.totalHalfDayShifts}个半日班，平均${formatOneDecimal(stats.averageHalfDayShifts)}个/人；最少完整休息${stats.minRest}天。`,
+  };
+}
+
+function summarizeStaffSwapItems(duties = [], swapOuts = []) {
+  const coverCount = duties.filter((duty) => normalizeStaffSwapNote(duty.swapNote)?.type === "cover").length;
+  const paybackCount = duties.filter((duty) => normalizeStaffSwapNote(duty.swapNote)?.type === "payback").length;
+  const movedOutCount = swapOuts.length;
+  const partnerNames = new Set();
+  duties.forEach((duty) => {
+    const note = normalizeStaffSwapNote(duty.swapNote);
+    if (note?.partnerId) {
+      partnerNames.add(getStaffDisplayName(note.partnerId));
+    }
+  });
+  swapOuts.forEach((item) => {
+    if (item.covererId) {
+      partnerNames.add(getStaffDisplayName(item.covererId));
+    }
+  });
+  return {
+    total: coverCount + paybackCount + movedOutCount,
+    coverCount,
+    paybackCount,
+    movedOutCount,
+    partnerNames: [...partnerNames],
+  };
+}
+
+function renderStaffOverviewAdvice(advice, stats, overview) {
+  return `
+    <div class="staff-overview-advice ${escapeHtml(advice.tone)}">
+      <div>
+        <strong>${escapeHtml(advice.title)}</strong>
+        <span>${escapeHtml(advice.detail)}</span>
+      </div>
+      <div class="staff-overview-stat-strip">
+        <span><b>${escapeHtml(stats.totalStaff)}</b>医护</span>
+        <span><b>${escapeHtml(stats.totalHalfDayShifts)}</b>半日班</span>
+        <span><b>${escapeHtml(stats.totalWorkedDays)}</b>工作日</span>
+        <span><b>${escapeHtml(stats.totalRestDays)}</b>休息日</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderStaffOverviewPersonCard(row, weekLabels = ["本周", "下周"]) {
+  const roleLabel = row.role === "doctor" ? "医生" : "护士";
+  const loadTone = row.shiftCount === 0 ? "rest" : row.restDays <= 2 ? "warning" : "ok";
+  const swapStats = row.swapStats || summarizeStaffSwapItems(row.duties, row.swapOuts);
+  const hasSwaps = swapStats.total > 0;
+  const swapPartnerText = swapStats.partnerNames?.length ? `；涉及 ${swapStats.partnerNames.slice(0, 4).join("、")}` : "";
+  return `
+    <article class="staff-overview-person-card ${escapeHtml(loadTone)} ${hasSwaps ? "has-swaps" : ""}">
+      <div class="staff-overview-person-head">
+        <div>
+          <strong>${escapeHtml(row.name)}</strong>
+          <span>${escapeHtml(roleLabel)} · ${escapeHtml(row.shiftCount)}个半日班 · 工作${escapeHtml(row.workedDays)}天 · 休息${escapeHtml(row.restDays)}天</span>
+        </div>
+        <div class="staff-overview-badges">
+          <span>${escapeHtml(row.fullDays)}天整日班</span>
+          <span>${row.shiftCount ? `${escapeHtml(row.restDays)}天休息` : "本轮无班"}</span>
+        </div>
+      </div>
+      ${hasSwaps ? `
+        <div class="staff-overview-swap-summary">
+          调班记录：原班调出${escapeHtml(swapStats.movedOutCount)}个，替别人上${escapeHtml(swapStats.coverCount)}个，补回别人${escapeHtml(swapStats.paybackCount)}个${escapeHtml(swapPartnerText)}
+        </div>
+      ` : ""}
+      ${renderStaffOverviewWeekLine(row, 1, weekLabels[0] || "本周")}
+      ${renderStaffOverviewWeekLine(row, 2, weekLabels[1] || "下周")}
+    </article>
+  `;
+}
+
+function renderStaffOverviewWeekLine(row = {}, weekNumber = 1, label = "本周") {
+  return `
+    <div class="staff-overview-week-line">
+      <span class="staff-overview-week-label">${escapeHtml(label)}</span>
+      ${WORKING_DAY_KEYS.map((dayKey) => renderStaffOverviewDayCell(row, weekNumber, dayKey)).join("")}
+    </div>
+  `;
+}
+
+function renderStaffOverviewDayCell(row = {}, weekNumber, dayKey) {
+  const duties = row.duties || [];
+  const swapOuts = row.swapOuts || [];
+  const dayItems = duties.filter((duty) => Number(duty.weekNumber) === Number(weekNumber) && String(duty.dayKey) === String(dayKey));
+  const swapOutItems = swapOuts.filter((item) => Number(item.weekNumber) === Number(weekNumber) && String(item.dayKey) === String(dayKey));
+  if (!dayItems.length && !swapOutItems.length) {
+    return `
+      <div class="staff-overview-day rest">
+        <b>${escapeHtml(getWeekDayLabel(dayKey))}</b>
+        <span>休</span>
+      </div>
+    `;
+  }
+  const hasBackup = dayItems.some((item) => String(item.role || "").includes("后备"));
+  const onlySwapOut = !dayItems.length && swapOutItems.length;
+  return `
+    <div class="staff-overview-day ${hasBackup ? "backup" : "work"} ${onlySwapOut ? "swap-rest" : ""}">
+      <b>${escapeHtml(getWeekDayLabel(dayKey))}</b>
+      ${dayItems.map(renderStaffOverviewDuty).join("")}
+      ${swapOutItems.map(renderStaffOverviewSwapOut).join("")}
+    </div>
+  `;
+}
+
+function renderStaffOverviewDuty(duty) {
+  const role = String(duty.role || "")
+    .replace("负责：", "")
+    .replace(" · ", " ");
+  const swapNote = normalizeStaffSwapNote(duty.swapNote);
+  const swapText = formatStaffSwapNote(swapNote, "long");
+  return `
+    <span>
+      ${escapeHtml(`${SHIFT_LABELS[duty.shift] || ""} ${role}`)}
+      ${swapText ? `<em class="staff-overview-swap-note ${escapeHtml(swapNote?.type || "")}">${escapeHtml(swapText)}</em>` : ""}
+    </span>
+  `;
+}
+
+function renderStaffOverviewSwapOut(item) {
+  const role = String(item.role || "")
+    .replace("负责：", "")
+    .replace(" · ", " ");
+  const note = normalizeStaffSwapNote(item.swapNote);
+  const groupText = note?.group ? `第${note.group}组` : "调班";
+  const related = note?.relatedDateValue
+    ? `；本人${formatDateLabel(note.relatedDateValue)}${note.relatedShift ? SHIFT_LABELS[note.relatedShift] : ""}补回`
+    : "";
+  return `
+    <span class="staff-overview-swap-out">
+      ${escapeHtml(`${SHIFT_LABELS[item.shift] || ""} 原${role}已调出`)}
+      <em>${escapeHtml(`${groupText}：由 ${getStaffDisplayName(item.covererId)} 替班${related}`)}</em>
+    </span>
+  `;
 }
 
 function renderStaffShiftCard(shift, shiftSchedule, requiredGroups, date, patientCount = 0) {
@@ -3330,8 +4182,10 @@ function saveStaffInput(event) {
     daySchedule[shift].doctors[index] = value;
   } else if (role === "nurse") {
     daySchedule[shift].nurses[index] = value;
+    clearStaffSwapNote(daySchedule, shift, "nurse", index);
   } else if (role === "backupNurse") {
     daySchedule[shift].backupNurse = value;
+    clearStaffSwapNote(daySchedule, shift, "backupNurse", -1);
   }
 
   if (scope === "weekly") {
@@ -3397,7 +4251,20 @@ function buildAutoWeeklyStaffSchedules(patientSchedules = {}, priority = state.s
   const restMaxMode = staffWorkMode === STAFF_WORK_MODE_REST_MAX;
   const restMaxSoftShiftCap = Number.isFinite(Number(options.restMaxSoftShiftCap))
     ? Number(options.restMaxSoftShiftCap)
-    : periodPrefix ? 15 : 8;
+    : 0;
+  const estimatedNurseDutyCount = estimateNurseDutyCountForPatientSchedules(patientSchedules);
+  const estimatedTotalNurseDutyCount = Number.isFinite(Number(options.estimatedTotalNurseDutyCount))
+    ? Number(options.estimatedTotalNurseDutyCount)
+    : estimatedNurseDutyCount;
+  const restMaxFairShiftTarget = restMaxMode && nurses.length
+    ? Math.max(1, Math.ceil(estimatedTotalNurseDutyCount / nurses.length))
+    : 0;
+  const restMaxFairShiftCap = restMaxMode
+    ? (restMaxSoftShiftCap || Math.max(2, restMaxFairShiftTarget + (periodPrefix ? 2 : 1)))
+    : 0;
+  const restMaxTargetActiveNurseCount = restMaxMode
+    ? Math.max(1, Math.min(nurses.length, estimatedTotalNurseDutyCount))
+    : nurses.length;
 
   [...doctors, ...nurses].forEach((staff) => {
     if (!assignmentCounts.has(staff.id)) assignmentCounts.set(staff.id, 0);
@@ -3431,6 +4298,9 @@ function buildAutoWeeklyStaffSchedules(patientSchedules = {}, priority = state.s
 
   const selectStaff = (pool, count, shift, dayKey, role, exclude = new Set(), sameDayPreferred = new Set()) => {
     const dayToken = `${periodPrefix}${dayKey}`;
+    const activeNurseCount = role === "nurse"
+      ? nurses.filter((staff) => (assignmentCounts.get(staff.id) || 0) > 0).length
+      : 0;
     return pool
       .filter((staff) => !exclude.has(staff.id))
       .map((staff) => {
@@ -3440,24 +4310,36 @@ function buildAutoWeeklyStaffSchedules(patientSchedules = {}, priority = state.s
         const hasWorkedThisDay = workedDays.has(dayToken);
         const hasAnyAssignment = currentAssignments > 0;
         const fullDayBonus = fullDayMode && shift === "afternoon" && sameDayPreferred.has(staff.id)
-          ? restMaxMode ? -160 : -80
+          ? restMaxMode ? -110 : -90
           : 0;
         const balancedSameDayPenalty = !fullDayMode && shift === "afternoon" && workedDays.has(dayToken) ? 12 : 0;
-        const restMaxUnusedPenalty = restMaxMode && !hasAnyAssignment ? 70 : 0;
-        const restMaxNewDayPenalty = restMaxMode && !hasWorkedThisDay ? 35 : 0;
-        const restMaxOverCapPenalty = restMaxMode && currentAssignments >= restMaxSoftShiftCap
-          ? (currentAssignments - restMaxSoftShiftCap + 1) * 95
+        const restMaxActivateUnusedBonus = restMaxMode && role === "nurse" && !hasAnyAssignment && activeNurseCount < restMaxTargetActiveNurseCount
+          ? -130
+          : 0;
+        const restMaxPreserveRestPenalty = restMaxMode && role === "nurse" && !hasAnyAssignment && activeNurseCount >= restMaxTargetActiveNurseCount
+          ? 25
+          : 0;
+        const restMaxSameDayBonus = restMaxMode && hasWorkedThisDay ? -25 : 0;
+        const restMaxNewDayPenalty = restMaxMode && !hasWorkedThisDay ? 28 : 0;
+        const restMaxOverFairPenalty = restMaxMode && currentAssignments >= restMaxFairShiftTarget
+          ? (currentAssignments - restMaxFairShiftTarget + 1) * 70
+          : 0;
+        const restMaxOverCapPenalty = restMaxMode && currentAssignments >= restMaxFairShiftCap
+          ? (currentAssignments - restMaxFairShiftCap + 1) * 130
           : 0;
         const restMaxLoadScore = restMaxMode
-          ? currentAssignments * 3 + workedDays.size * 2
+          ? currentAssignments * 18 + workedDays.size * 5
           : currentAssignments * 20 + workedDays.size * 5;
         return {
           staff,
           score:
             fullDayBonus +
             balancedSameDayPenalty +
-            restMaxUnusedPenalty +
+            restMaxActivateUnusedBonus +
+            restMaxPreserveRestPenalty +
+            restMaxSameDayBonus +
             restMaxNewDayPenalty +
+            restMaxOverFairPenalty +
             restMaxOverCapPenalty +
             restMaxLoadScore -
             preferredShiftScore * 2,
@@ -3527,7 +4409,7 @@ function buildAutoWeeklyStaffSchedules(patientSchedules = {}, priority = state.s
   });
 
   if (restMaxMode) {
-    warnings.push("医护排班采用休息最大化：优先把上午、下午集中给同一批人员，让更多护士获得完整休息日；护士长需复核个别人班次是否偏多。");
+    warnings.push("医护排班采用休息最大化：系统会优先形成整日班，同时把半日班尽量分摊到所有在岗护士；超过平均负担的人会被自动降权。");
   } else if (fullDayMode) {
     warnings.push("医护排班采用整日优先：下午班会优先沿用当天上午已排人员。");
   }
@@ -3581,13 +4463,20 @@ function renderSchedule() {
   const scheduleContext = { nurseProfile, staffSchedule };
 
   document.documentElement.style.setProperty("--machines-per-row", state.settings.machinesPerRow);
-  ui.boardTitle.textContent = !isChineseLanguage() ? `${formatDateLabel(date)} Schedule` : `${formatDateLabel(date)}排班`;
+  const morningPatientCount = countAssigned(daySchedule, machines, "morning");
+  const afternoonPatientCount = countAssigned(daySchedule, machines, "afternoon");
+  const morningStaffCount = countStaffWorkingForShift(staffSchedule, "morning");
+  const afternoonStaffCount = countStaffWorkingForShift(staffSchedule, "afternoon");
   const priorityLabel = getSchedulePriorityLabel();
   const pausedCount = getPausedMachineIds().length;
+  ui.boardTitle.textContent =
+    !isChineseLanguage()
+      ? `Staff on duty: AM ${morningStaffCount}, PM ${afternoonStaffCount}; Patients: AM ${morningPatientCount}, PM ${afternoonPatientCount}`
+      : `今日上班：上午 ${morningStaffCount} 人，下午 ${afternoonStaffCount} 人；今日透析：上午 ${morningPatientCount} 人，下午 ${afternoonPatientCount} 人`;
   ui.boardMeta.textContent =
     !isChineseLanguage()
-      ? `${state.settings.rowCount} rows, ${machines.length - pausedCount} available, ${pausedCount} paused · ${priorityLabel}`
-      : `${state.settings.rowCount} 排，可用 ${machines.length - pausedCount} 台，暂停 ${pausedCount} 台 · ${priorityLabel}`;
+      ? `${formatDateLabel(date)} schedule · ${state.settings.rowCount} rows, ${machines.length - pausedCount} available, ${pausedCount} paused · ${priorityLabel}`
+      : `${formatDateLabel(date)}排班 · ${state.settings.rowCount} 排，可用 ${machines.length - pausedCount} 台，暂停 ${pausedCount} 台 · ${priorityLabel}`;
 
   ui.machineRows.innerHTML = rows
     .map((row, index) => {
@@ -3615,7 +4504,7 @@ function renderShiftColumn(row, activeSlots, shift, daySchedule, conflictSet, sc
   return `
     <section class="shift-column shift-column-${shift}">
       <div class="shift-column-label">${SHIFT_LABELS[shift]}</div>
-      ${renderShiftBandPanel(shift, bands)}
+      ${renderShiftBandPanel(shift, bands, scheduleContext)}
       <div class="machine-grid shift-column-grid">
         ${row.map((slot) => slot.active
           ? renderShiftOnlyMachineCard(slot.machineId, shift, daySchedule[slot.machineId], conflictSet, scheduleContext)
@@ -3648,13 +4537,17 @@ function buildShiftBands(activeSlots, shift, scheduleContext, colorOffset = 0) {
     const endColumn = Math.max(...columns) + 1;
     const nurseId = nurseIds[groupIndex];
     const nurseName = nurseId ? getStaffDisplayName(nurseId) : `护士${groupIndex + 1}（未安排）`;
+    const swapNote = getStaffSwapNoteFromShift(scheduleContext.staffSchedule?.[shift], "nurse", groupIndex);
     const color = getNurseZoneColor(groupIndex + colorOffset);
     const zoneLabel = group.zoneLabel || (group.severeZone ? "重病区" : "普通区");
     return {
       shift,
       startColumn,
       endColumn,
+      nurseId,
       nurseName,
+      swapNote,
+      swapText: formatStaffSwapNote(swapNote),
       color,
       zoneLabel,
       patientCount: group.patientCount,
@@ -3667,9 +4560,17 @@ function buildShiftBands(activeSlots, shift, scheduleContext, colorOffset = 0) {
     .sort((left, right) => left.startColumn - right.startColumn || left.endColumn - right.endColumn);
 }
 
-function renderShiftBandPanel(shift, bands) {
+function renderShiftBandPanel(shift, bands, scheduleContext = null) {
+  const backupNurseId = scheduleContext?.staffSchedule?.[shift]?.backupNurse || "";
+  const backupSwapText = formatStaffSwapNote(getStaffSwapNoteFromShift(scheduleContext?.staffSchedule?.[shift], "backupNurse", -1));
   return `
     <section class="shift-band-panel shift-band-${shift}">
+      ${backupNurseId ? `
+        <div class="shift-backup-nurse">
+          <span>后备护士：${escapeHtml(getStaffDisplayName(backupNurseId))}</span>
+          ${backupSwapText ? `<em>${escapeHtml(backupSwapText)}</em>` : ""}
+        </div>
+      ` : ""}
       ${bands.length ? `
         <div class="aligned-nurse-grid shift-panel-grid">
           ${bands.map((band) => {
@@ -3680,6 +4581,7 @@ function renderShiftBandPanel(shift, bands) {
               <article class="aligned-nurse-band packed-band ${band.shift === "morning" ? "shift-morning" : "shift-afternoon"}"
                 style="grid-column:${band.startColumn} / ${band.endColumn};--nurse-accent:${escapeHtml(band.color.accent)};--nurse-soft:${escapeHtml(band.color.soft)};--nurse-border:${escapeHtml(band.color.border)}">
                 <div class="aligned-nurse-name">${escapeHtml(band.nurseName)}</div>
+                ${band.swapText ? `<div class="aligned-nurse-swap-note">${escapeHtml(band.swapText)}</div>` : ""}
                 <div class="aligned-nurse-machines">${machineButtons}</div>
                 <div class="aligned-nurse-meta">
                   <span>${escapeHtml(band.zoneLabel)}</span>
@@ -3843,6 +4745,7 @@ function saveAssignment() {
   }
 
   if (!patientId) {
+    captureUndoSnapshot("手工清空机位");
     clearScheduleSlot(targetSchedule, targetKey, machineId, shift, scope === "date" && Boolean(getWeeklySlot(date, machineId, shift)));
   } else {
     const patient = findPatient(patientId);
@@ -3874,7 +4777,10 @@ function saveAssignment() {
       if (!window.confirm(message)) {
         return;
       }
+      captureUndoSnapshot(`手工移动患者到${machineId}号机`);
       moveExistingAssignments(existing, date, shift, scope);
+    } else {
+      captureUndoSnapshot(`手工安排患者到${machineId}号机`);
     }
     setScheduleSlot(targetSchedule, targetKey, machineId, shift, {
       patientId,
@@ -3923,6 +4829,7 @@ function removeAssignment() {
   const scope = ui.assignmentScope.value === "date" ? "date" : "weekly";
   const targetSchedule = scope === "weekly" ? state.weeklySchedules : state.schedules;
   const targetKey = scope === "weekly" ? getWeekdayKey(date) : date;
+  captureUndoSnapshot("移除机位安排");
   clearScheduleSlot(targetSchedule, targetKey, machineId, shift, scope === "date" && Boolean(getWeeklySlot(date, machineId, shift)));
   pruneEmptySchedule(targetSchedule, targetKey, machineId);
   if (scope === "weekly") {
@@ -3982,7 +4889,7 @@ function openInsertPatientDialog() {
   getInsertFormField("scheduleScope").value = "date";
   getInsertFormField("treatmentType").value = DEFAULT_MACHINE_TYPE;
   getInsertFormField("weeklyTreatmentCount").value = "3";
-  getInsertFormField("monthlyHdfCount").value = "1";
+  getInsertFormField("monthlyHdfCount").value = "2";
   getInsertFormField("careLevel").value = STANDARD_CARE_LEVEL;
   const currentDayKey = getWeekdayKey(getCurrentDate());
   setInsertCheckedDays(WORKING_DAY_KEYS.includes(currentDayKey) ? [currentDayKey] : []);
@@ -3993,6 +4900,538 @@ function openInsertPatientDialog() {
 
 function closeInsertPatientDialog() {
   ui.insertPatientDialog.close();
+}
+
+function getActiveNurses() {
+  return state.staffMembers
+    .filter((staff) => staff.role === "nurse" && staff.status === "active")
+    .sort(sortStaffMembers);
+}
+
+function openShiftSwapDialog() {
+  renderShiftSwapNurseOptions();
+  ui.shiftSwapStartDate.value = getCurrentDate();
+  ui.shiftSwapDays.value = "7";
+  ui.shiftSwapMode.value = "specified";
+  renderShiftSwapCandidates();
+  syncShiftSwapCandidateHint();
+  ui.shiftSwapDialog.showModal();
+}
+
+function closeShiftSwapDialog() {
+  ui.shiftSwapDialog.close();
+}
+
+function renderShiftSwapNurseOptions() {
+  const nurses = getActiveNurses();
+  ui.shiftSwapTarget.innerHTML = [
+    `<option value="">${nurses.length ? "请选择护士" : "请先到医护库新增在岗护士"}</option>`,
+    ...nurses.map((staff) => {
+      const code = staff.code ? ` · ${staff.code}` : "";
+      return `<option value="${escapeHtml(staff.id)}">${escapeHtml(staff.name + code)}</option>`;
+    }),
+  ].join("");
+}
+
+function renderShiftSwapCandidates() {
+  const targetId = ui.shiftSwapTarget.value;
+  const nurses = getActiveNurses().filter((staff) => staff.id !== targetId);
+  if (!targetId) {
+    ui.shiftSwapCandidates.innerHTML = `<div class="shift-swap-empty">先选择需要连续休息的护士。</div>`;
+    return;
+  }
+  if (!nurses.length) {
+    ui.shiftSwapCandidates.innerHTML = `<div class="shift-swap-empty">暂无其他在岗护士可调班。</div>`;
+    return;
+  }
+  ui.shiftSwapCandidates.innerHTML = nurses
+    .map((staff) => {
+      const preference = staff.preferredShift ? SHIFT_LABELS[staff.preferredShift] : "不限";
+      const code = staff.code ? ` · ${staff.code}` : "";
+      return `
+        <label>
+          <input name="shiftSwapCandidate" type="checkbox" value="${escapeHtml(staff.id)}"/>
+          <span>${escapeHtml(`${staff.name}${code}（${preference}）`)}</span>
+        </label>
+      `;
+    })
+    .join("");
+}
+
+function syncShiftSwapCandidateHint() {
+  const specified = ui.shiftSwapMode.value === "specified";
+  ui.shiftSwapCandidateHint.textContent = specified
+    ? "当前为指定调班：只会从下面勾选的人里找人接班；如果不够，系统会停止并提示。"
+    : "当前为自动调班：系统会从所有在岗护士里找合适人员；下面勾选的人不会限制系统。";
+}
+
+function getSelectedShiftSwapCandidateIds() {
+  return [...ui.shiftSwapCandidates.querySelectorAll('input[name="shiftSwapCandidate"]:checked')]
+    .map((input) => input.value);
+}
+
+async function handleShiftSwapSubmit(event) {
+  event.preventDefault();
+  const targetId = ui.shiftSwapTarget.value;
+  const target = findStaff(targetId);
+  const startDate = ui.shiftSwapStartDate.value || getCurrentDate();
+  const days = clampNumber(ui.shiftSwapDays.value, 1, 31, 7);
+  const mode = ui.shiftSwapMode.value === "auto" ? "auto" : "specified";
+  const candidateIds = getSelectedShiftSwapCandidateIds();
+
+  if (!target || target.role !== "nurse" || target.status !== "active") {
+    window.alert("请先选择需要连续休息的在岗护士。");
+    return;
+  }
+  if (mode === "specified" && !candidateIds.length) {
+    window.alert("指定调班模式下，请至少勾选 1 名调班人。");
+    return;
+  }
+
+  closeShiftSwapDialog();
+  showTaskProgress("正在生成智能调班方案", "读取当前医护排班", 10);
+  await waitForBrowserPaint();
+  try {
+    const plan = await buildShiftSwapPlan({ targetId, startDate, days, mode, candidateIds });
+    if (!plan.changes.length && !plan.unresolved.length) {
+      await closeTaskProgress("没有需要调班的班次", 0);
+      window.alert(`${target.name} 在 ${plan.rangeText} 内没有已排医护班次，本来就可以休息。`);
+      return;
+    }
+    if (plan.unresolved.length) {
+      await closeTaskProgress("调班方案不完整", 0);
+      window.alert([
+        `${target.name} 还不能连续休息 ${days} 天，因为以下接班或补班没有安排完整：`,
+        "",
+        ...plan.unresolved.slice(0, 18).map((item) => `- ${item.label}`),
+        plan.unresolved.length > 18 ? `- 其余 ${plan.unresolved.length - 18} 项未显示` : "",
+        "",
+        mode === "specified" ? "建议：增加指定调班人，或改用系统自动找人。" : "建议：延长后续可补班周期、新增在岗护士，或手动调整这些班次。",
+      ].filter(Boolean).join("\n"));
+      return;
+    }
+
+    await stepTaskProgress(76, "生成调班预览");
+    const preview = formatShiftSwapPreview(plan);
+    await closeTaskProgress("调班方案已生成", 0);
+    if (!window.confirm(preview)) {
+      return;
+    }
+
+    showTaskProgress("正在保存智能调班", "写入临时医护排班覆盖", 84);
+    await waitForBrowserPaint();
+    captureUndoSnapshot(`智能调班 ${target.name} 连休${days}天`);
+    Object.entries(plan.daySchedules).forEach(([dateValue, daySchedule]) => {
+      state.staffSchedules[dateValue] = structuredClone(daySchedule);
+    });
+    saveState();
+    await stepTaskProgress(94, "刷新医护排班和排班台");
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    await closeTaskProgress("智能调班已完成");
+    showShiftSwapResultDialog(plan);
+    showToast(`${target.name} 已安排 ${days} 天连续休息，替班 ${plan.changes.length} 个半日班，后续补回 ${plan.compensations.length} 个半日班`);
+  } catch (error) {
+    console.error("智能调班失败", error);
+    await closeTaskProgress("智能调班失败", 0);
+    window.alert(`智能调班失败：${error?.message || error}`);
+  }
+}
+
+async function buildShiftSwapPlan({ targetId, startDate, days, mode, candidateIds }) {
+  const start = parseDateInput(startDate);
+  const dates = Array.from({ length: days }, (_, index) => formatDateInput(addDays(start, index)));
+  const protectedDateSet = new Set(dates);
+  const candidatePool = getShiftSwapCandidatePool(targetId, mode, candidateIds);
+  const loadMap = await buildShiftSwapLoadMap([findStaff(targetId), ...candidatePool].filter(Boolean), startDate);
+  const usage = new Map();
+  const daySchedules = {};
+  const changes = [];
+  const compensations = [];
+  const unresolved = [];
+
+  await stepTaskProgress(18, `准备 ${candidatePool.length} 名候选接班护士`);
+  for (let dateIndex = 0; dateIndex < dates.length; dateIndex += 1) {
+    const dateValue = dates[dateIndex];
+    const nurseCount = getRequiredNurseCountForDate(dateValue);
+    const daySchedule = getShiftSwapPlanDaySchedule(dateValue, daySchedules, nurseCount);
+    const assignments = getNurseAssignmentsForStaff(daySchedule, targetId);
+    assignments.forEach((assignment) => {
+      const replacement = findShiftSwapReplacement({
+        dateValue,
+        daySchedule,
+        assignment,
+        candidatePool,
+        targetId,
+        usage,
+        loadMap,
+      });
+      if (!replacement) {
+        unresolved.push({
+          type: "cover",
+          dateValue,
+          label: `找不到接班人：${formatDateLabel(dateValue)} ${SHIFT_LABELS[assignment.shift]} ${assignment.roleLabel}`,
+        });
+        return;
+      }
+      const groupNumber = changes.length + 1;
+      setNurseAssignment(daySchedule, assignment, replacement.id, {
+        type: "cover",
+        partnerId: targetId,
+        group: groupNumber,
+        text: `替${getStaffDisplayName(targetId)}`,
+      });
+      usage.set(replacement.id, (usage.get(replacement.id) || 0) + 1);
+      loadMap.set(replacement.id, (loadMap.get(replacement.id) || 0) + 1);
+      loadMap.set(targetId, Math.max(0, (loadMap.get(targetId) || 0) - 1));
+      changes.push({
+        group: groupNumber,
+        dateValue,
+        shift: assignment.shift,
+        role: assignment.role,
+        index: assignment.index,
+        roleLabel: assignment.roleLabel,
+        fromId: targetId,
+        toId: replacement.id,
+      });
+    });
+    if (assignments.length) {
+      daySchedules[dateValue] = normalizeStaffScheduleDay(daySchedule, getStoredStaffNurseCount(daySchedule));
+    }
+    await stepTaskProgress(20 + Math.round(((dateIndex + 1) / Math.max(dates.length, 1)) * 34), `检查连休窗口 ${dateIndex + 1}/${dates.length} 天`);
+  }
+
+  if (!unresolved.length) {
+    for (let changeIndex = 0; changeIndex < changes.length; changeIndex += 1) {
+      const change = changes[changeIndex];
+      const compensation = await findShiftSwapCompensation({
+        change,
+        targetId,
+        startSearchDate: formatDateInput(addDays(start, days)),
+        protectedDateSet,
+        daySchedules,
+      });
+      if (!compensation) {
+        unresolved.push({
+          type: "payback",
+          dateValue: change.dateValue,
+          label: `找不到补班位置：${getStaffDisplayName(change.toId)} 已替 ${getStaffDisplayName(targetId)} 上 ${formatDateLabel(change.dateValue)} ${SHIFT_LABELS[change.shift]}，但后续没有可让 ${getStaffDisplayName(targetId)} 补回的班次`,
+        });
+        break;
+      }
+      compensations.push(compensation);
+      const coverSchedule = getShiftSwapPlanDaySchedule(change.dateValue, daySchedules);
+      setNurseAssignment(coverSchedule, change, change.toId, {
+        type: "cover",
+        partnerId: targetId,
+        group: change.group,
+        relatedDateValue: compensation.dateValue,
+        relatedShift: compensation.shift,
+        text: `替${getStaffDisplayName(targetId)}；${getStaffDisplayName(targetId)}后续补回`,
+      });
+      daySchedules[change.dateValue] = normalizeStaffScheduleDay(coverSchedule, getStoredStaffNurseCount(coverSchedule));
+      loadMap.set(targetId, (loadMap.get(targetId) || 0) + 1);
+      loadMap.set(change.toId, Math.max(0, (loadMap.get(change.toId) || 0) - 1));
+      await stepTaskProgress(56 + Math.round(((changeIndex + 1) / Math.max(changes.length, 1)) * 18), `安排后续补班 ${changeIndex + 1}/${changes.length}`);
+    }
+  }
+
+  return {
+    targetId,
+    startDate: formatDateInput(start),
+    endDate: formatDateInput(addDays(start, days - 1)),
+    days,
+    mode,
+    candidatePool,
+    changes,
+    compensations,
+    unresolved,
+    daySchedules,
+    rangeText: `${formatDateLabel(formatDateInput(start))} 至 ${formatDateLabel(formatDateInput(addDays(start, days - 1)))}`,
+  };
+}
+
+function getShiftSwapCandidatePool(targetId, mode, candidateIds = []) {
+  const activeNurses = getActiveNurses().filter((staff) => staff.id !== targetId);
+  const allowed = mode === "specified" ? new Set(candidateIds.map(String)) : null;
+  return activeNurses.filter((staff) => !allowed || allowed.has(staff.id));
+}
+
+async function buildShiftSwapLoadMap(staffList, centerDateValue) {
+  const uniqueStaff = [...new Map(staffList.map((staff) => [staff.id, staff])).values()];
+  const loadMap = new Map(uniqueStaff.map((staff) => [staff.id, 0]));
+  const center = parseDateInput(centerDateValue);
+  const dateValues = Array.from({ length: 14 }, (_, index) => formatDateInput(addDays(center, index - 6)));
+  for (let index = 0; index < dateValues.length; index += 1) {
+    const dateValue = dateValues[index];
+    const daySchedule = getStaffScheduleForShiftSwapDate(dateValue, getRequiredNurseCountForDate(dateValue));
+    uniqueStaff.forEach((staff) => {
+      const count = STAFF_SHIFT_KEYS.filter((shift) => isNurseScheduledInShift(daySchedule, shift, staff.id)).length;
+      if (count) {
+        loadMap.set(staff.id, (loadMap.get(staff.id) || 0) + count);
+      }
+    });
+    if ((index + 1) % 4 === 0) {
+      await waitForBrowserPaint();
+    }
+  }
+  return loadMap;
+}
+
+function getStaffScheduleForShiftSwapDate(dateValue, nurseCount) {
+  if (state.staffSchedules?.[dateValue]) {
+    return normalizeStaffScheduleDay(structuredClone(state.staffSchedules[dateValue]), nurseCount);
+  }
+  if (hasTwoWeekCycleTemplate()) {
+    const weekKey = getCycleWeekKey(getCycleWeekNumberForDate(dateValue));
+    const dayKey = getWeekdayKey(dateValue);
+    const cycleDay = state.twoWeekCycle?.staffSchedules?.[weekKey]?.[dayKey];
+    if (cycleDay) {
+      return normalizeStaffScheduleDay(structuredClone(cycleDay), nurseCount);
+    }
+  }
+  const weekly = state.weeklyStaffSchedules?.[getWeekdayKey(dateValue)];
+  return weekly ? normalizeStaffScheduleDay(structuredClone(weekly), nurseCount) : createEmptyStaffScheduleDay(nurseCount);
+}
+
+function getShiftSwapPlanDaySchedule(dateValue, daySchedules, nurseCount = getRequiredNurseCountForDate(dateValue)) {
+  if (!daySchedules[dateValue]) {
+    daySchedules[dateValue] = getStaffScheduleForShiftSwapDate(dateValue, nurseCount);
+  }
+  return daySchedules[dateValue];
+}
+
+function getNurseAssignmentsForStaff(daySchedule = {}, staffId) {
+  const assignments = [];
+  STAFF_SHIFT_KEYS.forEach((shift) => {
+    const entry = daySchedule?.[shift] || {};
+    (entry.nurses || []).forEach((value, index) => {
+      if (value === staffId) {
+        assignments.push({ shift, role: "nurse", index, roleLabel: `责任护士${index + 1}` });
+      }
+    });
+    if (entry.backupNurse === staffId) {
+      assignments.push({ shift, role: "backupNurse", index: -1, roleLabel: "后备护士" });
+    }
+  });
+  return assignments;
+}
+
+async function findShiftSwapCompensation({ change, targetId, startSearchDate, protectedDateSet, daySchedules }) {
+  const start = parseDateInput(startSearchDate);
+  const searchDays = 56;
+  for (let offset = 0; offset < searchDays; offset += 1) {
+    if (offset > 0 && offset % 7 === 0) {
+      await waitForBrowserPaint();
+    }
+    const dateValue = formatDateInput(addDays(start, offset));
+    if (protectedDateSet.has(dateValue)) {
+      continue;
+    }
+    const daySchedule = getShiftSwapPlanDaySchedule(dateValue, daySchedules);
+    const assignments = getNurseAssignmentsForStaff(daySchedule, change.toId)
+      .filter((assignment) => !isNurseScheduledInShift(daySchedule, assignment.shift, targetId))
+      .sort((left, right) =>
+        Number(right.shift === change.shift) - Number(left.shift === change.shift) ||
+        Number(right.role === change.role) - Number(left.role === change.role) ||
+        STAFF_SHIFT_KEYS.indexOf(left.shift) - STAFF_SHIFT_KEYS.indexOf(right.shift) ||
+        left.roleLabel.localeCompare(right.roleLabel, "zh-CN", { numeric: true }),
+      );
+    if (!assignments.length) {
+      continue;
+    }
+    const assignment = assignments[0];
+    setNurseAssignment(daySchedule, assignment, targetId, {
+      type: "payback",
+      partnerId: change.toId,
+      group: change.group,
+      relatedDateValue: change.dateValue,
+      relatedShift: change.shift,
+      text: `补回${getStaffDisplayName(change.toId)}`,
+    });
+    daySchedules[dateValue] = normalizeStaffScheduleDay(daySchedule, getStoredStaffNurseCount(daySchedule));
+    return {
+      dateValue,
+      shift: assignment.shift,
+      role: assignment.role,
+      roleLabel: assignment.roleLabel,
+      fromId: change.toId,
+      toId: targetId,
+      originalChange: change,
+    };
+  }
+  return null;
+}
+
+function findShiftSwapReplacement({ dateValue, daySchedule, assignment, candidatePool, targetId, usage, loadMap }) {
+  const available = candidatePool
+    .filter((staff) => staff.id !== targetId)
+    .filter((staff) => !isNurseScheduledInShift(daySchedule, assignment.shift, staff.id));
+  if (!available.length) {
+    return null;
+  }
+  return [...available].sort((left, right) => {
+    const leftBusy = isNurseScheduledInDay(daySchedule, left.id) ? 1 : 0;
+    const rightBusy = isNurseScheduledInDay(daySchedule, right.id) ? 1 : 0;
+    const leftUsage = usage.get(left.id) || 0;
+    const rightUsage = usage.get(right.id) || 0;
+    const leftPreference = scoreShiftPreference(left, assignment.shift);
+    const rightPreference = scoreShiftPreference(right, assignment.shift);
+    const leftLoad = loadMap?.get(left.id) || 0;
+    const rightLoad = loadMap?.get(right.id) || 0;
+    return leftUsage - rightUsage ||
+      leftBusy - rightBusy ||
+      rightPreference - leftPreference ||
+      leftLoad - rightLoad ||
+      sortStaffMembers(left, right);
+  })[0];
+}
+
+function isNurseScheduledInShift(daySchedule = {}, shift, staffId) {
+  const entry = daySchedule?.[shift] || {};
+  return (entry.nurses || []).includes(staffId) || entry.backupNurse === staffId;
+}
+
+function isNurseScheduledInDay(daySchedule = {}, staffId) {
+  return STAFF_SHIFT_KEYS.some((shift) => isNurseScheduledInShift(daySchedule, shift, staffId));
+}
+
+function countNurseHalfDayAssignments(staffId, centerDateValue) {
+  const center = parseDateInput(centerDateValue);
+  return Array.from({ length: 14 }, (_, index) => formatDateInput(addDays(center, index - 6)))
+    .reduce((count, dateValue) => {
+      const daySchedule = getStaffScheduleForShiftSwapDate(dateValue, getRequiredNurseCountForDate(dateValue));
+      return count + STAFF_SHIFT_KEYS.filter((shift) => isNurseScheduledInShift(daySchedule, shift, staffId)).length;
+    }, 0);
+}
+
+function setNurseAssignment(daySchedule, assignment, replacementId, swapNote = null) {
+  const entry = daySchedule[assignment.shift];
+  if (assignment.role === "backupNurse") {
+    entry.backupNurse = replacementId;
+    setStaffSwapNote(daySchedule, assignment.shift, "backupNurse", -1, swapNote);
+    return;
+  }
+  entry.nurses[assignment.index] = replacementId;
+  setStaffSwapNote(daySchedule, assignment.shift, "nurse", assignment.index, swapNote);
+}
+
+function formatShiftSwapPreview(plan) {
+  const targetName = getStaffDisplayName(plan.targetId);
+  const replacementNames = [...new Set(plan.changes.map((item) => getStaffDisplayName(item.toId)))].join("、");
+  const coverLines = plan.changes.slice(0, 14).map((item) =>
+    `- ${formatDateLabel(item.dateValue)} ${SHIFT_LABELS[item.shift]} ${item.roleLabel}：${targetName} → ${getStaffDisplayName(item.toId)}`,
+  );
+  const paybackLines = plan.compensations.slice(0, 14).map((item) =>
+    `- ${formatDateLabel(item.dateValue)} ${SHIFT_LABELS[item.shift]} ${item.roleLabel}：${getStaffDisplayName(item.fromId)} → ${targetName}`,
+  );
+  const hiddenCover = plan.changes.length > coverLines.length ? [`- 其余 ${plan.changes.length - coverLines.length} 个替班未显示`] : [];
+  const hiddenPayback = plan.compensations.length > paybackLines.length ? [`- 其余 ${plan.compensations.length - paybackLines.length} 个补班未显示`] : [];
+  const modeText = plan.mode === "specified"
+    ? "只使用护士长指定的调班人。"
+    : "系统自动找人；请护士长或该护士再与接班人确认。";
+  return [
+    `确认执行智能调班吗？`,
+    "",
+    `${targetName} 将在 ${plan.rangeText} 连续休息 ${plan.days} 天。`,
+    `别人先替 ${targetName} 上 ${plan.changes.length} 个半日班；${targetName} 后面补回 ${plan.compensations.length} 个半日班。`,
+    `接班人：${replacementNames || "无"}`,
+    modeText,
+    "",
+    "一、休息期间谁替她：",
+    ...coverLines,
+    ...hiddenCover,
+    "",
+    "二、后面她替谁补回：",
+    ...paybackLines,
+    ...hiddenPayback,
+  ].join("\n");
+}
+
+function showShiftSwapResultDialog(plan) {
+  const targetName = getStaffDisplayName(plan.targetId);
+  ui.shiftSwapResultTitle.textContent = `智能调班明细：${targetName}`;
+  ui.shiftSwapResultMeta.textContent = `${plan.rangeText} 连续休息 ${plan.days} 天；休息期间替班 ${plan.changes.length} 个半日班，后续补班 ${plan.compensations.length} 个半日班。`;
+  ui.shiftSwapResultContent.innerHTML = renderShiftSwapResultTable(plan);
+  ui.shiftSwapResultDialog.showModal();
+}
+
+function renderShiftSwapResultTable(plan) {
+  const targetName = getStaffDisplayName(plan.targetId);
+  const rows = [
+    ...plan.changes.map((item, index) => ({
+      type: "休息期间替班",
+      dateValue: item.dateValue,
+      shift: item.shift,
+      roleLabel: item.roleLabel,
+      fromName: targetName,
+      toName: getStaffDisplayName(item.toId),
+      relation: `${getStaffDisplayName(item.toId)} 先替 ${targetName}；对应补班见第 ${index + 1} 组`,
+      group: index + 1,
+      tone: "cover",
+    })),
+    ...plan.compensations.map((item, index) => ({
+      type: "后续补班",
+      dateValue: item.dateValue,
+      shift: item.shift,
+      roleLabel: item.roleLabel,
+      fromName: getStaffDisplayName(item.fromId),
+      toName: targetName,
+      relation: `${targetName} 补回 ${getStaffDisplayName(item.fromId)}；对应替班为第 ${index + 1} 组`,
+      group: index + 1,
+      tone: "payback",
+    })),
+  ].sort((left, right) =>
+    left.group - right.group ||
+    Number(left.tone === "payback") - Number(right.tone === "payback") ||
+    String(left.dateValue).localeCompare(String(right.dateValue)),
+  );
+
+  const body = rows.map((row) => `
+    <tr class="shift-swap-result-row ${escapeHtml(row.tone)}">
+      <td>${escapeHtml(String(row.group))}</td>
+      <td><span class="shift-swap-result-type">${escapeHtml(row.type)}</span></td>
+      <td>${escapeHtml(formatDateLabel(row.dateValue))}</td>
+      <td>${escapeHtml(SHIFT_LABELS[row.shift] || row.shift)}</td>
+      <td>${escapeHtml(row.roleLabel)}</td>
+      <td>${escapeHtml(row.fromName)}</td>
+      <td>${escapeHtml(row.toName)}</td>
+      <td>${escapeHtml(row.relation)}</td>
+    </tr>
+  `).join("");
+
+  return `
+    <section class="review-section shift-swap-result-summary">
+      <h3>护士长核对重点</h3>
+      <div class="shift-swap-summary-grid">
+        <span><b>休息护士</b>${escapeHtml(targetName)}</span>
+        <span><b>连续休息</b>${escapeHtml(`${plan.days} 天`)}</span>
+        <span><b>替班</b>${escapeHtml(`${plan.changes.length} 个半日班`)}</span>
+        <span><b>补班</b>${escapeHtml(`${plan.compensations.length} 个半日班`)}</span>
+      </div>
+    </section>
+    <section class="review-section">
+      <h3>换班明细表</h3>
+      <div class="review-table-wrap shift-swap-result-table-wrap">
+        <table class="review-table shift-swap-result-table">
+          <thead>
+            <tr>
+              <th>组</th>
+              <th>类型</th>
+              <th>日期</th>
+              <th>班次</th>
+              <th>岗位</th>
+              <th>原护士</th>
+              <th>调整后护士</th>
+              <th>对应关系</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
 }
 
 function syncInsertMonthlyHdfAvailability() {
@@ -4062,7 +5501,7 @@ function validateInsertPatient(patient, scheduleScope) {
   return problems;
 }
 
-function handleInsertPatientSubmit(event) {
+async function handleInsertPatientSubmit(event) {
   event.preventDefault();
   if (event.submitter?.value === "cancel") {
     ui.insertPatientDialog.close();
@@ -4081,23 +5520,46 @@ function handleInsertPatientSubmit(event) {
     return;
   }
 
-  const result = scheduleScope === "longTerm"
-    ? insertLongTermPatient(patient)
-    : insertTemporaryDatePatient(patient);
+  const submitButton = ui.insertPatientForm?.querySelector('[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
+  showTaskProgress("正在插入患者", "检查患者资料和排班范围", 8);
+  await waitForBrowserPaint();
 
-  if (!result.ok) {
-    window.alert(`无法插入患者：\n\n${result.messages.map((item) => `- ${item}`).join("\n")}`);
-    return;
+  try {
+    await stepTaskProgress(
+      28,
+      scheduleScope === "longTerm" ? "正在检查长期2周循环空位" : "正在检查当前日期空位",
+    );
+    captureUndoSnapshot(`插入患者 ${patient.name}`);
+    await stepTaskProgress(52, "优先寻找不移动原有患者的空位");
+    const result = scheduleScope === "longTerm"
+      ? insertLongTermPatient(patient)
+      : insertTemporaryDatePatient(patient);
+
+    if (!result.ok) {
+      await closeTaskProgress("没有找到可用空位", 0);
+      window.alert(`无法插入患者：\n\n${result.messages.map((item) => `- ${item}`).join("\n")}`);
+      return;
+    }
+
+    await stepTaskProgress(76, "写入患者资料和排班结果");
+    ui.insertPatientDialog.close();
+    saveState();
+    await stepTaskProgress(90, "刷新排班台和统计");
+    renderPatientTable();
+    renderWeekNavigation();
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    await closeTaskProgress("患者已插入");
+    showToast(result.message);
+  } catch (error) {
+    console.error("插入患者失败", error);
+    await closeTaskProgress("插入患者失败", 0);
+    window.alert(`插入患者失败：${error?.message || error}`);
+  } finally {
+    if (submitButton) submitButton.disabled = false;
   }
-
-  ui.insertPatientDialog.close();
-  saveState();
-  renderPatientTable();
-  renderWeekNavigation();
-  renderStaffSchedule();
-  renderSchedule();
-  renderSummary();
-  showToast(result.message);
 }
 
 function insertTemporaryDatePatient(patient) {
@@ -4208,6 +5670,190 @@ function buildLongTermNoMoveInsertionPlan(patient) {
   };
 }
 
+function buildIncrementalPatientReplan(previousPatient, patient) {
+  const patientIndex = getPatientPlanningIndex(patient.id);
+  const result = {
+    touched: false,
+    complete: true,
+    assignedCount: 0,
+    removedCount: 0,
+    messages: [],
+    warnings: [],
+    weeklySchedules: null,
+    twoWeekPatientSchedules: null,
+    dateSchedules: null,
+  };
+
+  const previousDateKeys = getDateKeysForPatientInSchedules(state.schedules, patient.id);
+  const dateSchedules = structuredClone(state.schedules || {});
+  const removedDateCount = removePatientFromScheduleCollectionWithCount(dateSchedules, patient.id);
+  if (removedDateCount) {
+    result.touched = true;
+    result.removedCount += removedDateCount;
+    result.dateSchedules = dateSchedules;
+  }
+
+  if (patient.temporaryInsert) {
+    if (patient.status !== "paused") {
+      previousDateKeys.forEach((dateValue) => {
+        const dayKey = getWeekdayKey(dateValue);
+        const baseDay = dateSchedules[dateValue] || {};
+        const direct = buildExactDayInsertion(patient, dayKey, baseDay, normalizeMachineType(patient.treatmentType));
+        if (direct.assignment) {
+          dateSchedules[dateValue] = direct.daySchedule;
+          setScheduleSlot(dateSchedules, dateValue, direct.assignment.machineId, direct.assignment.shift, {
+            patientId: patient.id,
+            treatmentType: normalizeMachineType(patient.treatmentType),
+            note: "临时患者资料变更后自动重排",
+            updatedAt: new Date().toISOString(),
+          });
+          result.assignedCount += 1;
+        } else {
+          result.complete = false;
+          result.messages.push(`${formatDateLabel(dateValue)} 没有适合 ${patient.name} 的临时空位。${explainInsertionNoSlot(patient, dayKey, baseDay, normalizeMachineType(patient.treatmentType))}`);
+        }
+      });
+    } else {
+      result.warnings.push(`${patient.name} 已暂停，已从临时日期排班中移除。`);
+    }
+    result.dateSchedules = dateSchedules;
+    result.touched = result.touched || Boolean(previousDateKeys.length);
+    return result;
+  }
+
+  if (hasTwoWeekCycleTemplate()) {
+    const patientSchedules = {
+      week1: structuredClone(state.twoWeekCycle?.patientSchedules?.week1 || {}),
+      week2: structuredClone(state.twoWeekCycle?.patientSchedules?.week2 || {}),
+    };
+    const activeWeekKey = getCycleWeekKey();
+    if (state.weeklySchedules && Object.keys(state.weeklySchedules).length) {
+      patientSchedules[activeWeekKey] = structuredClone(state.weeklySchedules);
+    }
+
+    result.removedCount += removePatientFromScheduleCollectionWithCount(patientSchedules.week1, patient.id);
+    result.removedCount += removePatientFromScheduleCollectionWithCount(patientSchedules.week2, patient.id);
+    result.touched = true;
+
+    if (isSchedulablePatient(patient)) {
+      const week1Base = structuredClone(patientSchedules.week1);
+      const week1 = buildWeeklyInsertionForPatient(patient, week1Base, 1, patientIndex);
+      if (week1.ok) {
+        patientSchedules.week1 = week1.schedules;
+        result.assignedCount += countPatientAssignmentsInWeeklySchedules(week1.schedules, patient.id);
+      } else {
+        result.complete = false;
+        result.messages.push(...(week1.messages || []));
+        patientSchedules.week1 = week1Base;
+      }
+
+      const week2Base = structuredClone(patientSchedules.week2);
+      const week2 = buildWeeklyInsertionForPatient(patient, week2Base, 2, patientIndex);
+      if (week2.ok) {
+        patientSchedules.week2 = week2.schedules;
+        result.assignedCount += countPatientAssignmentsInWeeklySchedules(week2.schedules, patient.id);
+      } else {
+        result.complete = false;
+        result.messages.push(...(week2.messages || []));
+        patientSchedules.week2 = week2Base;
+      }
+    } else {
+      result.warnings.push(`${patient.name} 当前不是在透长期患者，已从长期排班中移除。`);
+    }
+
+    result.twoWeekPatientSchedules = patientSchedules;
+    return result;
+  }
+
+  if (state.weeklySchedules && Object.keys(state.weeklySchedules).length) {
+    const weeklyBase = structuredClone(state.weeklySchedules || {});
+    result.removedCount += removePatientFromScheduleCollectionWithCount(weeklyBase, patient.id);
+    result.touched = true;
+    if (isSchedulablePatient(patient)) {
+      const weekly = buildWeeklyInsertionForPatient(patient, weeklyBase, 1, patientIndex);
+      if (weekly.ok) {
+        result.weeklySchedules = weekly.schedules;
+        result.assignedCount += countPatientAssignmentsInWeeklySchedules(weekly.schedules, patient.id);
+      } else {
+        result.complete = false;
+        result.messages.push(...(weekly.messages || []));
+        result.weeklySchedules = weeklyBase;
+      }
+    } else {
+      result.weeklySchedules = weeklyBase;
+      result.warnings.push(`${patient.name} 当前不是在透长期患者，已从周模板中移除。`);
+    }
+  }
+
+  return result;
+}
+
+function applyIncrementalPatientReplan(result) {
+  if (!result?.touched) {
+    return;
+  }
+  if (result.dateSchedules) {
+    state.schedules = result.dateSchedules;
+  }
+  if (result.twoWeekPatientSchedules) {
+    ensureTwoWeekCycleState();
+    state.twoWeekCycle.patientSchedules.week1 = result.twoWeekPatientSchedules.week1 || {};
+    state.twoWeekCycle.patientSchedules.week2 = result.twoWeekPatientSchedules.week2 || {};
+    state.twoWeekCycle.review = null;
+    state.twoWeekCycle.savedAt = new Date().toISOString();
+    state.twoWeekCycle.anchorWeekStart = state.twoWeekCycle.anchorWeekStart || normalizeCycleAnchorWeekStart(getCurrentDate());
+    syncCycleWeekToWeeklyView();
+    return;
+  }
+  if (result.weeklySchedules) {
+    state.weeklySchedules = result.weeklySchedules;
+  }
+}
+
+function removePatientFromScheduleCollectionWithCount(scheduleCollection, patientId) {
+  let removedCount = 0;
+  Object.entries(scheduleCollection || {}).forEach(([key, daySchedule]) => {
+    Object.entries(daySchedule || {}).forEach(([machineId, item]) => {
+      STAFF_SHIFT_KEYS.forEach((shift) => {
+        if (item?.[shift]?.patientId === patientId) {
+          delete item[shift];
+          removedCount += 1;
+        }
+      });
+      pruneEmptySchedule(scheduleCollection, key, machineId);
+    });
+  });
+  return removedCount;
+}
+
+function getDateKeysForPatientInSchedules(scheduleCollection = {}, patientId) {
+  return Object.entries(scheduleCollection || {})
+    .filter(([, daySchedule]) => getAssignmentsForPatientInDay(patientId, daySchedule || {}).length)
+    .map(([dateValue]) => dateValue);
+}
+
+function countPatientAssignmentsInWeeklySchedules(weeklySchedules = {}, patientId) {
+  return Object.values(weeklySchedules || {}).reduce(
+    (total, daySchedule) => total + getAssignmentsForPatientInDay(patientId, daySchedule || {}).length,
+    0,
+  );
+}
+
+function formatIncrementalPatientReplanNotice(patient, result) {
+  if (!result?.touched) {
+    return "";
+  }
+  const base = `${patient.name} 的资料已保存；系统已只重排该患者，未移动其他患者。`;
+  if (result.complete) {
+    return `${base} 新排入 ${result.assignedCount} 次治疗，移除旧位置 ${result.removedCount} 个。`;
+  }
+  return [
+    `${base} 但没有找到完整空位，已移除旧位置 ${result.removedCount} 个，当前自动排入 ${result.assignedCount} 次。`,
+    "请护士长在排班台或2周报告里为该患者人工补排缺少的治疗。",
+    ...(result.messages || []).slice(0, 8),
+  ].join("\n");
+}
+
 function explainInsertionNoSlot(patient, dayKey, daySchedule = {}, treatmentType = patient?.treatmentType) {
   if (!WORKING_DAY_KEYS.includes(String(dayKey))) {
     return "当前日期不是治疗日。";
@@ -4250,21 +5896,21 @@ function getMachineZoneLabelForPatient(patient) {
   return isSeverePatient(patient) ? "重病区/普通区" : "普通区";
 }
 
-function buildWeeklyInsertionForPatient(patient, baseWeeklySchedules = {}, weekNumber = 1) {
+function buildWeeklyInsertionForPatient(patient, baseWeeklySchedules = {}, weekNumber = 1, patientIndex = getPatientPlanningIndex(patient?.id)) {
   const schedules = structuredClone(baseWeeklySchedules || {});
   WORKING_DAY_KEYS.forEach((dayKey) => {
     schedules[dayKey] ||= {};
   });
-  const plannedDays = getPatientPlannedDays(patient, state.patients.length, SCHEDULE_PRIORITY_PATIENT)
+  const plannedDays = getPatientPlannedDays(patient, patientIndex, SCHEDULE_PRIORITY_PATIENT)
     .filter((dayKey) => WORKING_DAY_KEYS.includes(dayKey));
   if (!plannedDays.length) {
-    return { ok: false, messages: [`${patient.name} 没有可用的工作日透析倾向。`] };
+    return { ok: false, schedules, messages: [`${patient.name} 没有可用的工作日透析倾向。`] };
   }
 
   const hdfCount = normalizeMachineType(patient.treatmentType) === DEFAULT_MACHINE_TYPE
-    ? getTwoWeekHdfCountForWeek(patient, weekNumber, state.patients.length)
+    ? getTwoWeekHdfCountForWeek(patient, weekNumber, patientIndex)
     : 0;
-  const hdfIndexes = getEvenlyDistributedSessionIndexes(plannedDays.length, hdfCount, state.patients.length + weekNumber);
+  const hdfIndexes = getEvenlyDistributedSessionIndexes(plannedDays.length, hdfCount, patientIndex + weekNumber);
   const assignedDaysByPatient = new Map();
   const assignedMachineByPatient = new Map();
 
@@ -4284,6 +5930,7 @@ function buildWeeklyInsertionForPatient(patient, baseWeeklySchedules = {}, weekN
     if (!assignment) {
       return {
         ok: false,
+        schedules,
         messages: [`第${weekNumber}周 ${getWeekDayLabel(dayKey)} 没有适合 ${patient.name} 的空位。${explainInsertionNoSlot(patient, dayKey, schedules[dayKey], treatmentType)} 系统不会移动已经排好的患者；请调整新人资料，或由护士长先手动腾出空位。`],
       };
     }
@@ -4292,7 +5939,7 @@ function buildWeeklyInsertionForPatient(patient, baseWeeklySchedules = {}, weekN
   return { ok: true, schedules };
 }
 
-function savePatientFromForm(event) {
+async function savePatientFromForm(event) {
   event.preventDefault();
   const previousPatient = ui.patientId.value ? findPatient(ui.patientId.value) : null;
   const selectedFixedMachine = String(ui.patientFixedMachine.value || "").trim();
@@ -4321,7 +5968,9 @@ function savePatientFromForm(event) {
           : "",
     preferredDays: getCheckedValues(ui.patientPreferredDays),
     forcePreferredDays: ui.forcePreferredDays.checked,
+    temporaryInsert: Boolean(previousPatient?.temporaryInsert),
     note: ui.patientNote.value,
+    demo: Boolean(previousPatient?.demo),
     updatedAt: new Date().toISOString(),
   });
 
@@ -4330,7 +5979,10 @@ function savePatientFromForm(event) {
     return;
   }
 
-  if (patient.fixedMachineId) {
+  const placementCriticalChanged = hasPatientPlacementCriticalChanges(previousPatient, patient);
+  const schedulePlanChanged = hasPatientSchedulePlanChanges(previousPatient, patient);
+  const fixedMachineChanged = (previousPatient?.fixedMachineId || "") !== (patient.fixedMachineId || "");
+  if (patient.fixedMachineId && (!previousPatient || fixedMachineChanged || placementCriticalChanged)) {
     if (isMachinePaused(patient.fixedMachineId) && previousPatient?.fixedMachineId !== patient.fixedMachineId) {
       window.alert(getDynamicMessage("fixedMachinePaused", { machineId: patient.fixedMachineId }));
       return;
@@ -4356,7 +6008,7 @@ function savePatientFromForm(event) {
     const newLabel = patient.fixedMachineId ? `${patient.fixedMachineId}号机` : "首次自动排班后重新固定";
     const weeklyLocations = getWeeklyLocationsForPatient(state.weeklySchedules, patient.id);
     const hasDifferentWeeklyLocation = weeklyLocations.some((location) => location.machineId !== patient.fixedMachineId);
-    if (weeklyLocations.length && hasDifferentWeeklyLocation && !window.confirm(`固定机位将从“${oldLabel}”改为“${newLabel}”。现有周模板不会自动移动，需要重新生成周模板。仍要保存吗？`)) {
+    if (weeklyLocations.length && hasDifferentWeeklyLocation && !window.confirm(`固定机位将从“${oldLabel}”改为“${newLabel}”。保存后系统会只重排这名患者，尽量不影响其他患者。仍要保存吗？`)) {
       return;
     }
   }
@@ -4366,27 +6018,47 @@ function savePatientFromForm(event) {
     return;
   }
 
-  const compatibilityIssues = getPatientCompatibilityIssues(patient);
-  if (compatibilityIssues.length) {
-    window.alert(`不能保存 ${patient.name} 的资料。新的治疗类型或感染标识与以下现有排班不匹配，请先移动或清空：\n\n${compatibilityIssues.slice(0, 12).map((item) => `- ${item}`).join("\n")}`);
-    return;
-  }
+  showTaskProgress("正在保存患者资料", schedulePlanChanged ? "准备只重排这个患者" : "检查患者基础资料", 12);
+  await waitForBrowserPaint();
+  try {
+    const index = state.patients.findIndex((item) => item.id === patient.id);
+    let replanResult = null;
+    if (schedulePlanChanged && previousPatient && index >= 0) {
+      await stepTaskProgress(30, "从原排班中取出该患者并寻找新空位");
+      replanResult = buildIncrementalPatientReplan(previousPatient, patient);
+    }
 
-  const index = state.patients.findIndex((item) => item.id === patient.id);
-  if (index >= 0) {
-    state.patients[index] = patient;
-  } else {
-    state.patients.push(patient);
-  }
+    await stepTaskProgress(48, "创建撤销记录并写入患者库");
+    captureUndoSnapshot(index >= 0 ? `编辑患者 ${patient.name}` : `新增患者 ${patient.name}`);
+    if (index >= 0) {
+      state.patients[index] = patient;
+    } else {
+      state.patients.push(patient);
+    }
+    if (replanResult) {
+      await stepTaskProgress(64, "应用该患者的增量重排结果");
+      applyIncrementalPatientReplan(replanResult);
+    }
 
-  saveState();
-  fillPatientForm(patient);
-  renderPatientTable();
-  renderWeekNavigation();
-  renderStaffSchedule();
-  renderSchedule();
-  renderSummary();
-  showToast(getDynamicMessage("patientSaved"));
+    saveState();
+    await stepTaskProgress(82, "刷新患者库、排班台和统计");
+    fillPatientForm(patient);
+    renderPatientTable();
+    renderWeekNavigation();
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    await closeTaskProgress("患者资料已保存");
+    const replanNotice = formatIncrementalPatientReplanNotice(patient, replanResult);
+    showToast(replanNotice || getDynamicMessage("patientSaved"));
+    if (replanResult && !replanResult.complete) {
+      window.alert(replanNotice);
+    }
+  } catch (error) {
+    console.error("保存患者资料失败", error);
+    await closeTaskProgress("保存患者资料失败", 0);
+    window.alert(`保存患者资料失败：${error?.message || error}`);
+  }
 }
 
 function fillPatientForm(patient) {
@@ -4432,7 +6104,7 @@ function resetPatientForm() {
   ui.deletePatient.classList.add("hidden");
 }
 
-function deleteSelectedPatient() {
+async function deleteSelectedPatient() {
   const id = ui.patientId.value;
   if (!id) {
     return;
@@ -4447,16 +6119,29 @@ function deleteSelectedPatient() {
     return;
   }
 
-  state.patients = state.patients.filter((item) => item.id !== id);
-  removePatientFromSchedules(id);
-  saveState();
-  resetPatientForm();
-  renderPatientTable();
-  renderWeekNavigation();
-  renderStaffSchedule();
-  renderSchedule();
-  renderSummary();
-  showToast(getDynamicMessage("patientDeleted"));
+  showTaskProgress("正在删除患者", "创建撤销记录", 12);
+  await waitForBrowserPaint();
+  try {
+    captureUndoSnapshot(`删除患者 ${patient.name}`);
+    await stepTaskProgress(38, "从患者库移除");
+    state.patients = state.patients.filter((item) => item.id !== id);
+    await stepTaskProgress(62, "从长期模板和当前排班移除");
+    removePatientFromSchedules(id);
+    saveState();
+    await stepTaskProgress(84, "刷新患者库、排班台和统计");
+    resetPatientForm();
+    renderPatientTable();
+    renderWeekNavigation();
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    await closeTaskProgress("患者已删除");
+    showToast(getDynamicMessage("patientDeleted"));
+  } catch (error) {
+    console.error("删除患者失败", error);
+    await closeTaskProgress("删除患者失败", 0);
+    window.alert(`删除患者失败：${error?.message || error}`);
+  }
 }
 
 function removePatientFromSchedules(patientId) {
@@ -4544,6 +6229,7 @@ function renderPatientTable() {
 
 function saveStaffFromForm(event) {
   event.preventDefault();
+  const previousStaff = ui.staffId.value ? findStaff(ui.staffId.value) : null;
   const staff = normalizeStaffMember({
     id: ui.staffId.value || createId(),
     name: ui.staffName.value,
@@ -4553,6 +6239,7 @@ function saveStaffFromForm(event) {
     preferredShift: ui.staffPreferredShift.value,
     status: ui.staffStatus.value,
     note: ui.staffNote.value,
+    demo: Boolean(previousStaff?.demo),
     updatedAt: new Date().toISOString(),
   });
 
@@ -4567,6 +6254,7 @@ function saveStaffFromForm(event) {
   }
 
   const index = state.staffMembers.findIndex((item) => item.id === staff.id);
+  captureUndoSnapshot(index >= 0 ? `编辑医护 ${staff.name}` : `新增医护 ${staff.name}`);
   if (index >= 0) {
     state.staffMembers[index] = staff;
   } else {
@@ -4602,7 +6290,7 @@ function resetStaffForm() {
   ui.deleteStaff.classList.add("hidden");
 }
 
-function deleteSelectedStaff() {
+async function deleteSelectedStaff() {
   const id = ui.staffId.value;
   if (!id) {
     return;
@@ -4616,14 +6304,27 @@ function deleteSelectedStaff() {
     return;
   }
 
-  state.staffMembers = state.staffMembers.filter((item) => item.id !== id);
-  removeStaffFromSchedules(id);
-  saveState();
-  resetStaffForm();
-  renderStaffTable();
-  renderStaffSchedule();
-  renderSummary();
-  showToast(getDynamicMessage("staffDeleted"));
+  showTaskProgress("正在删除医护", "创建撤销记录", 12);
+  await waitForBrowserPaint();
+  try {
+    captureUndoSnapshot(`删除医护 ${staff.name}`);
+    await stepTaskProgress(38, "从医护库移除");
+    state.staffMembers = state.staffMembers.filter((item) => item.id !== id);
+    await stepTaskProgress(64, "从长期模板和当前排班移除");
+    removeStaffFromSchedules(id);
+    saveState();
+    await stepTaskProgress(86, "刷新医护库和排班统计");
+    resetStaffForm();
+    renderStaffTable();
+    renderStaffSchedule();
+    renderSummary();
+    await closeTaskProgress("医护已删除");
+    showToast(getDynamicMessage("staffDeleted"));
+  } catch (error) {
+    console.error("删除医护失败", error);
+    await closeTaskProgress("删除医护失败", 0);
+    window.alert(`删除医护失败：${error?.message || error}`);
+  }
 }
 
 function renderStaffTable() {
@@ -4707,18 +6408,18 @@ function removeStaffFromSchedules(staffId) {
   }
 }
 
-function generateDemoData() {
-  const patientCount = clampNumber(ui.demoPatientCount.value, 0, 300, 36);
+async function generateDemoData() {
+  const patientCount = clampNumber(ui.demoPatientCount.value, 0, 300, 194);
   const doctorCount = clampNumber(ui.demoDoctorCount.value, 0, 50, 4);
-  const nurseCount = clampNumber(ui.demoNurseCount.value, 0, 200, 10);
+  const nurseCount = clampNumber(ui.demoNurseCount.value, 0, 200, 21);
   const infectionCounts = {
     HBC: clampNumber(ui.demoHbcCount.value, 0, 300, 0),
-    HBV: clampNumber(ui.demoHbvCount.value, 0, 300, 2),
-    HCV: clampNumber(ui.demoHcvCount.value, 0, 300, 1),
-    T: clampNumber(ui.demoTCount.value, 0, 300, 1),
+    HBV: clampNumber(ui.demoHbvCount.value, 0, 300, 24),
+    HCV: clampNumber(ui.demoHcvCount.value, 0, 300, 0),
+    T: clampNumber(ui.demoTCount.value, 0, 300, 4),
   };
   const infectiousCount = Object.values(infectionCounts).reduce((total, count) => total + count, 0);
-  const severeCount = Math.min(patientCount, clampNumber(ui.demoSevereCount.value, 0, 300, 4));
+  const severeCount = Math.min(patientCount, clampNumber(ui.demoSevereCount.value, 0, 300, 80));
   const demoMonthlyHdfCount = normalizeEvenHdfCount(ui.demoMonthlyHdfCount.value, 2);
   if (!patientCount && !doctorCount && !nurseCount) {
     showToast(getDynamicMessage("enterDemoCount"));
@@ -4729,27 +6430,44 @@ function generateDemoData() {
     return;
   }
 
-  const infectionFlags = DEMO_INFECTION_FLAGS.flatMap((flag) => Array(infectionCounts[flag]).fill(flag));
-  const batch = Date.now().toString(36);
-  const patients = Array.from({ length: patientCount }, (_, index) =>
-    createDemoPatient(index, batch, infectionFlags, severeCount, demoMonthlyHdfCount),
-  );
-  const doctors = Array.from({ length: doctorCount }, (_, index) => createDemoStaff(index, batch, "doctor"));
-  const nurses = Array.from({ length: nurseCount }, (_, index) => createDemoStaff(index, batch, "nurse"));
-  state.patients.push(...patients);
-  state.staffMembers.push(...doctors, ...nurses);
-  saveState();
-  resetPatientForm();
-  resetStaffForm();
-  renderPatientTable();
-  renderStaffTable();
-  renderWeekNavigation();
-  renderStaffSchedule();
-  renderSchedule();
-  renderSummary();
-  renderLayoutPreviewFromForm();
-  const infectionSummary = DEMO_INFECTION_FLAGS.map((flag) => `${flag} ${infectionCounts[flag]} 名`).join("、");
-  showToast(`已生成 ${patients.length} 名患者（${infectionSummary}）、${doctors.length + nurses.length} 名医护演示数据`);
+  ui.generateDemoData.disabled = true;
+  try {
+    showTaskProgress("正在生成演示数据", "准备患者、医护和感染分区参数", 8);
+    await waitForBrowserPaint();
+    const infectionFlags = DEMO_INFECTION_FLAGS.flatMap((flag) => Array(infectionCounts[flag]).fill(flag));
+    const batch = Date.now().toString(36);
+    await stepTaskProgress(24, "生成患者资料");
+    const patients = Array.from({ length: patientCount }, (_, index) =>
+      createDemoPatient(index, batch, infectionFlags, severeCount, demoMonthlyHdfCount),
+    );
+    await stepTaskProgress(52, "生成医生和护士资料");
+    const doctors = Array.from({ length: doctorCount }, (_, index) => createDemoStaff(index, batch, "doctor"));
+    const nurses = Array.from({ length: nurseCount }, (_, index) => createDemoStaff(index, batch, "nurse"));
+    await stepTaskProgress(70, "写入演示数据");
+    captureUndoSnapshot("生成演示数据");
+    state.patients.push(...patients);
+    state.staffMembers.push(...doctors, ...nurses);
+    saveState();
+    await stepTaskProgress(88, "刷新患者库、医护库和排班台");
+    resetPatientForm();
+    resetStaffForm();
+    renderPatientTable();
+    renderStaffTable();
+    renderWeekNavigation();
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    renderLayoutPreviewFromForm();
+    const infectionSummary = DEMO_INFECTION_FLAGS.map((flag) => `${flag} ${infectionCounts[flag]} 名`).join("、");
+    await closeTaskProgress("演示数据已生成");
+    showToast(`已生成 ${patients.length} 名患者（${infectionSummary}）、${doctors.length + nurses.length} 名医护演示数据`);
+  } catch (error) {
+    console.error("Generate demo data failed", error);
+    await closeTaskProgress("生成演示数据失败", 0);
+    window.alert(`生成演示数据失败：${error?.message || error}`);
+  } finally {
+    ui.generateDemoData.disabled = false;
+  }
 }
 
 function createDemoPatient(index, batch, infectionFlags, severeCount, demoMonthlyHdfCount) {
@@ -4787,9 +6505,11 @@ function createDemoPatient(index, batch, infectionFlags, severeCount, demoMonthl
 }
 
 function createDemoStaff(index, batch, role) {
+  const roleShort = role === "doctor" ? "医" : "护";
+  const baseName = createDemoName(index + (role === "doctor" ? 40 : 80));
   return normalizeStaffMember({
     id: createId(),
-    name: `${role === "doctor" ? "医" : "护"}${createDemoName(index + (role === "doctor" ? 40 : 80))}`,
+    name: `${baseName}（${roleShort}）`,
     code: `DEMO-${role === "doctor" ? "D" : "N"}-${batch}-${String(index + 1).padStart(3, "0")}`,
     role,
     phone: `1390000${String(index + 1).padStart(4, "0")}`,
@@ -4808,7 +6528,7 @@ function createDemoName(index) {
   return `${last}${first}${second}`;
 }
 
-function clearDemoData() {
+async function clearDemoData() {
   const demoPatientIds = state.patients.filter((patient) => patient.demo).map((patient) => patient.id);
   const demoStaffIds = state.staffMembers.filter((staff) => staff.demo).map((staff) => staff.id);
   if (!demoPatientIds.length && !demoStaffIds.length) {
@@ -4823,24 +6543,41 @@ function clearDemoData() {
     return;
   }
 
-  demoPatientIds.forEach(removePatientFromSchedules);
-  demoStaffIds.forEach(removeStaffFromSchedules);
-  state.patients = state.patients.filter((patient) => !patient.demo);
-  state.staffMembers = state.staffMembers.filter((staff) => !staff.demo);
-  pruneEmptyStaffSchedules();
-  saveState();
-  resetPatientForm();
-  resetStaffForm();
-  renderPatientTable();
-  renderStaffTable();
-  renderWeekNavigation();
-  renderStaffSchedule();
-  renderSchedule();
-  renderSummary();
-  showToast(getDynamicMessage("demoDataCleared"));
+  ui.clearDemoData.disabled = true;
+  try {
+    showTaskProgress("正在清除演示数据", "查找演示患者和医护", 10);
+    await waitForBrowserPaint();
+    await stepTaskProgress(35, "从排班中移除演示患者");
+    captureUndoSnapshot("清除演示数据");
+    demoPatientIds.forEach(removePatientFromSchedules);
+    await stepTaskProgress(58, "从医护排班中移除演示医护");
+    demoStaffIds.forEach(removeStaffFromSchedules);
+    await stepTaskProgress(72, "清理患者库和医护库");
+    state.patients = state.patients.filter((patient) => !patient.demo);
+    state.staffMembers = state.staffMembers.filter((staff) => !staff.demo);
+    pruneEmptyStaffSchedules();
+    saveState();
+    await stepTaskProgress(88, "刷新界面");
+    resetPatientForm();
+    resetStaffForm();
+    renderPatientTable();
+    renderStaffTable();
+    renderWeekNavigation();
+    renderStaffSchedule();
+    renderSchedule();
+    renderSummary();
+    await closeTaskProgress("演示数据已清除");
+    showToast(getDynamicMessage("demoDataCleared"));
+  } catch (error) {
+    console.error("Clear demo data failed", error);
+    await closeTaskProgress("清除演示数据失败", 0);
+    window.alert(`清除演示数据失败：${error?.message || error}`);
+  } finally {
+    ui.clearDemoData.disabled = false;
+  }
 }
 
-function saveLayout(event) {
+async function saveLayout(event) {
   event.preventDefault();
   const settings = {
     roomName: ui.roomName.value.trim() || DEFAULT_STATE.settings.roomName,
@@ -4882,14 +6619,20 @@ function saveLayout(event) {
     return;
   }
 
+  showTaskProgress("正在应用布局设置", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("修改布局设置");
+  await stepTaskProgress(38, "写入机器行列、类型和分区");
   state.settings = settings;
   saveState();
+  await stepTaskProgress(70, "刷新统计、机位和固定机位选项");
   renderHeader();
   renderSummary();
   renderStaffSchedule();
   renderSchedule();
   renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
   renderLayoutPreviewFromForm();
+  await closeTaskProgress("布局设置已应用");
   showToast(getDynamicMessage("layoutApplied"));
 }
 
@@ -4971,7 +6714,7 @@ function getLayoutCompatibilityIssues(nextSettings) {
   return issues;
 }
 
-function restoreDefaultLayout() {
+async function restoreDefaultLayout() {
   const nextSettings = {
     ...structuredClone(DEFAULT_STATE.settings),
     roomName: state.settings.roomName || DEFAULT_STATE.settings.roomName,
@@ -4993,8 +6736,13 @@ function restoreDefaultLayout() {
     return;
   }
 
+  showTaskProgress("正在恢复默认布局", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("恢复默认布局");
+  await stepTaskProgress(42, "恢复默认60台机器布局");
   state.settings = nextSettings;
   saveState();
+  await stepTaskProgress(76, "刷新布局和排班界面");
   renderSettingsForm();
   renderHeader();
   renderSummary();
@@ -5002,6 +6750,7 @@ function restoreDefaultLayout() {
   renderSchedule();
   renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
   renderLayoutPreviewFromForm();
+  await closeTaskProgress("默认布局已恢复");
   showToast(getDynamicMessage("default60LayoutRestored"));
 }
 
@@ -5015,6 +6764,10 @@ function renderSettingsForm() {
     .map((item) => `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)}</option>`)
     .join("");
   ui.languageSelect.value = normalizeLanguageCode(state.settings.language);
+  ui.themeSelect.innerHTML = UI_THEMES
+    .map((item) => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`)
+    .join("");
+  ui.themeSelect.value = normalizeTheme(state.settings.theme);
   ui.schedulePriority.value = normalizeSchedulePriority(state.settings.schedulePriority);
   ui.staffWorkMode.value = normalizeStaffWorkMode(state.settings.staffWorkMode);
   renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
@@ -5083,11 +6836,27 @@ function renderLanguage() {
   ui.languageSelect.setAttribute("aria-label", text.language);
 }
 
+function renderTheme() {
+  const theme = normalizeTheme(state.settings.theme);
+  document.documentElement.dataset.theme = theme;
+  if (ui.themeSelect) {
+    ui.themeSelect.value = theme;
+  }
+}
+
 function saveLanguage() {
   state.settings.language = normalizeLanguageCode(ui.languageSelect.value);
   saveState();
   renderAll();
   showToast(getText().languageUpdated || "Language updated");
+}
+
+function saveTheme() {
+  state.settings.theme = normalizeTheme(ui.themeSelect.value);
+  renderTheme();
+  saveState();
+  const themeLabel = UI_THEMES.find((item) => item.key === state.settings.theme)?.label || "明亮";
+  showToast(`已切换为${themeLabel}界面`);
 }
 
 function saveSchedulePriority() {
@@ -5109,7 +6878,7 @@ function saveStaffWorkMode() {
   const messages = {
     [STAFF_WORK_MODE_BALANCED]: "已切换为均衡轮班：尽量分散上午、下午班次，避免连续整日上班",
     [STAFF_WORK_MODE_FULL_DAY]: "已切换为整日优先：尽量让同一名护士连续上上午、下午，集中工作日并空出整天休息",
-    [STAFF_WORK_MODE_REST_MAX]: "已切换为休息最大化：优先集中给部分护士整日班，让更多护士获得完整休息日",
+    [STAFF_WORK_MODE_REST_MAX]: "已切换为休息最大化：优先整日班，同时把半日班尽量均衡分给所有在岗护士",
   };
   showToast(messages[state.settings.staffWorkMode] || messages[STAFF_WORK_MODE_BALANCED]);
 }
@@ -5428,7 +7197,7 @@ function getFixedMachineTemplateIssues(daySchedule) {
   return issues;
 }
 
-function saveCurrentWeekAsWeeklyTemplate() {
+async function saveCurrentWeekAsWeeklyTemplate() {
   const selectedDate = parseDateInput(getCurrentDate());
   const weekStart = getWeekStart(selectedDate);
   const weekEnd = addDays(weekStart, 5);
@@ -5484,6 +7253,10 @@ function saveCurrentWeekAsWeeklyTemplate() {
     return;
   }
 
+  showTaskProgress("正在保存当前周模板", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("保存当前周为长期周模板");
+  await stepTaskProgress(42, "写入周一至周六患者和医护模板");
   weekEntries.forEach((entry) => {
     if (Object.keys(entry.schedule || {}).length) {
       state.weeklySchedules[entry.dayKey] = structuredClone(entry.schedule);
@@ -5504,21 +7277,29 @@ function saveCurrentWeekAsWeeklyTemplate() {
   delete state.weeklySchedules[REST_DAY_KEY];
   delete state.weeklyStaffSchedules[REST_DAY_KEY];
   saveState();
+  await stepTaskProgress(78, "刷新排班台和医护统计");
   renderWeekNavigation();
   renderStaffSchedule();
   renderSchedule();
   renderSummary();
+  await closeTaskProgress("当前周模板已保存");
   showToast(getDynamicMessage("weekSavedAsRecurringTemplate"));
 }
 
 async function autoScheduleWeeklyTemplate() {
+  showTaskProgress("正在自动生成周模板", "生成患者治疗安排", 8);
+  await waitForBrowserPaint();
   const priority = normalizeSchedulePriority(state.settings.schedulePriority);
+  await stepTaskProgress(24, "排列患者日期、班次和机位");
   const patientResult = buildAutoWeeklyPatientSchedules(getCurrentDate(), priority);
+  await stepTaskProgress(50, "安排医生、责任护士和后备护士");
   const staffResult = buildAutoWeeklyStaffSchedules(patientResult.schedules, priority);
+  await stepTaskProgress(68, "执行安全检查");
   const safetyErrors = validateGeneratedWeeklySafety(patientResult.schedules, staffResult.schedules);
   const blocking = [...patientResult.blocking, ...staffResult.blocking, ...safetyErrors];
 
   if (blocking.length) {
+    await closeTaskProgress("周模板自动排班已阻止", 0);
     window.alert(`周模板自动排班未保存：\n\n${blocking.map((item) => `- ${item}`).join("\n")}`);
     return;
   }
@@ -5575,12 +7356,18 @@ async function autoScheduleWeeklyTemplate() {
     confirmLines,
   });
   lastScheduleReview = scheduleReview;
+  await closeTaskProgress("周模板建议已生成，请复核", 0);
   const approved = await showScheduleReviewDialog(scheduleReview, true);
   if (!approved) {
     return;
   }
 
+  showTaskProgress("正在保存自动周模板", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("生成长期周模板");
+  await stepTaskProgress(32, "清理旧的月度血滤调整");
   clearGeneratedMonthlyHdfOverrides();
+  await stepTaskProgress(52, "写入周模板排班");
   WORKING_DAY_KEYS.forEach((dayKey) => {
     if (Object.keys(patientResult.schedules[dayKey] || {}).length) {
       state.weeklySchedules[dayKey] = patientResult.schedules[dayKey];
@@ -5592,6 +7379,7 @@ async function autoScheduleWeeklyTemplate() {
   delete state.weeklySchedules[REST_DAY_KEY];
   delete state.weeklyStaffSchedules[REST_DAY_KEY];
   const fixedAt = new Date().toISOString();
+  await stepTaskProgress(70, "固定首次自动分配机位");
   Object.entries(patientResult.fixedMachineAssignments || {}).forEach(([patientId, machineId]) => {
     const patient = findPatient(patientId);
     if (patient && !patient.fixedMachineId && machineId) {
@@ -5604,11 +7392,13 @@ async function autoScheduleWeeklyTemplate() {
     state.schedules[date] = mergeDateOverrideDays(state.schedules[date] || {}, override);
   });
   saveState();
+  await stepTaskProgress(88, "刷新患者、医护和排班台");
   renderPatientTable();
   renderWeekNavigation();
   renderStaffSchedule();
   renderSchedule();
   renderSummary();
+  await closeTaskProgress("自动周模板已保存");
   showToast(newFixedMachineCount ? `已生成长期周模板，并为 ${newFixedMachineCount} 名患者固定机位` : "已生成长期循环周模板并沿用固定机位");
   if (lastScheduleReview) {
     lastScheduleReview.savedAt = new Date().toISOString();
@@ -7183,7 +8973,7 @@ function createFullDayOverride(generatedSchedule, previousEffectiveSchedule) {
   return override;
 }
 
-function copyPreviousDay() {
+async function copyPreviousDay() {
   const current = new Date(`${getCurrentDate()}T00:00:00`);
   current.setDate(current.getDate() - 1);
   const previousDate = formatDateInput(current);
@@ -7199,6 +8989,10 @@ function copyPreviousDay() {
     return;
   }
 
+  showTaskProgress("正在复制前一天排班", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("复制前一天排班");
+  await stepTaskProgress(42, "复制患者机位安排");
   if (previous && Object.keys(previous).length) {
     state.schedules[getCurrentDate()] = structuredClone(previous);
   } else {
@@ -7210,14 +9004,16 @@ function copyPreviousDay() {
     delete state.staffSchedules[getCurrentDate()];
   }
   saveState();
+  await stepTaskProgress(78, "刷新排班台");
   renderWeekNavigation();
   renderStaffSchedule();
   renderSchedule();
   renderSummary();
+  await closeTaskProgress("前一天排班已复制");
   showToast(getDynamicMessage("previousDayCopied"));
 }
 
-function clearCurrentDay() {
+async function clearCurrentDay() {
   const date = getCurrentDate();
   const effectiveSchedule = getEffectiveScheduleForDate(date);
   const hasMachineSchedule = Object.keys(effectiveSchedule).length;
@@ -7231,6 +9027,10 @@ function clearCurrentDay() {
     return;
   }
 
+  showTaskProgress("正在清空当天排班", "创建撤销快照", 12);
+  await waitForBrowserPaint();
+  captureUndoSnapshot(`清空${formatDateLabel(date)}排班`);
+  await stepTaskProgress(45, "清空患者和医护排班");
   if (hasMachineSchedule) {
     state.schedules[date] = createRemovedOverrideDay(effectiveSchedule);
   } else {
@@ -7240,24 +9040,37 @@ function clearCurrentDay() {
     delete state.staffSchedules[date];
   }
   saveState();
+  await stepTaskProgress(78, "刷新当天排班界面");
   renderWeekNavigation();
   renderStaffSchedule();
   renderSchedule();
   renderSummary();
+  await closeTaskProgress("当天排班已清空");
   showToast(getDynamicMessage("dayScheduleCleared"));
 }
 
-function exportData() {
-  pruneEmptyStaffSchedules();
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `血透室排班数据-${getCurrentDate()}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+async function exportData() {
+  showTaskProgress("正在导出数据", "整理患者、排班、医护和布局资料", 15);
+  await waitForBrowserPaint();
+  try {
+    pruneEmptyStaffSchedules();
+    await stepTaskProgress(55, "生成 JSON 备份文件");
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `血透室排班数据-${getCurrentDate()}.json`;
+    document.body.appendChild(link);
+    await stepTaskProgress(82, "准备下载");
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    await closeTaskProgress("数据导出完成");
+  } catch (error) {
+    console.error("Export data failed", error);
+    await closeTaskProgress("导出数据失败", 0);
+    window.alert(`导出数据失败：${error?.message || error}`);
+  }
 }
 
 function isSchedulerDataObject(value) {
@@ -7275,15 +9088,21 @@ function importData(event) {
   }
 
   const reader = new FileReader();
-  reader.onload = () => {
+  reader.onload = async () => {
+    showTaskProgress("正在导入数据", "读取 JSON 文件", 10);
+    await waitForBrowserPaint();
     try {
+      await stepTaskProgress(28, "解析文件内容");
       const parsed = JSON.parse(reader.result);
       if (!isSchedulerDataObject(parsed)) {
         throw new Error("Not a scheduler data export");
       }
+      await stepTaskProgress(48, "规范化患者、医护和排班数据");
       const imported = normalizeState(parsed);
+      await stepTaskProgress(68, "执行导入安全检查");
       const audit = validateImportedStateSafety(imported);
       if (audit.errors.length) {
+        await closeTaskProgress("导入已阻止", 0);
         window.alert(`导入已阻止：检测到可能影响排班安全的数据错误。\n\n${audit.errors.slice(0, 24).map((item) => `- ${item}`).join("\n")}${audit.errors.length > 24 ? `\n- 其余 ${audit.errors.length - 24} 项未显示` : ""}`);
         return;
       }
@@ -7291,8 +9110,11 @@ function importData(event) {
         ? `\n\n需要人工复核：\n${audit.warnings.slice(0, 16).map((item) => `- ${item}`).join("\n")}`
         : "";
       if (!window.confirm(`导入会替换当前本地数据，继续吗？${warningText}`)) {
+        await closeTaskProgress("已取消导入", 0);
         return;
       }
+      await stepTaskProgress(82, "写入本地数据");
+      captureUndoSnapshot("导入数据");
       state.settings = imported.settings;
       state.patients = imported.patients;
       state.staffMembers = imported.staffMembers;
@@ -7301,10 +9123,13 @@ function importData(event) {
       state.weeklyStaffSchedules = imported.weeklyStaffSchedules;
       state.staffSchedules = imported.staffSchedules;
       saveState();
+      await stepTaskProgress(92, "刷新界面");
       renderAll();
+      await closeTaskProgress("数据导入完成");
       showToast(getDynamicMessage("dataImported"));
     } catch (error) {
       console.error(error);
+      await closeTaskProgress("导入失败", 0);
       showToast(getDynamicMessage("importFileUnrecognized"));
     } finally {
       event.target.value = "";
@@ -7313,12 +9138,16 @@ function importData(event) {
   reader.readAsText(file);
 }
 
-function resetAllData() {
+async function resetAllData() {
   const message = "确定全部重置吗？这会清空本地保存的患者资料、患者排班、医护排班、机器类型和特殊区机器设置。";
   if (!window.confirm(message)) {
     return;
   }
 
+  showTaskProgress("正在全部重置", "创建撤销快照", 10);
+  await waitForBrowserPaint();
+  captureUndoSnapshot("全部重置");
+  await stepTaskProgress(38, "恢复默认资料和布局");
   const fresh = structuredClone(DEFAULT_STATE);
   state.settings = fresh.settings;
   state.patients = fresh.patients;
@@ -7328,6 +9157,7 @@ function resetAllData() {
   state.weeklyStaffSchedules = fresh.weeklyStaffSchedules;
   state.staffSchedules = fresh.staffSchedules;
   localStorage.removeItem(STORAGE_KEY);
+  await stepTaskProgress(72, "清空界面状态");
   ui.scheduleDate.value = formatDateInput(new Date());
   ui.patientSearch.value = "";
   ui.staffSearch.value = "";
@@ -7336,6 +9166,7 @@ function resetAllData() {
   resetStaffForm();
   renderAll();
   ui.storageStatus.textContent = "已全部重置，本地数据已清空";
+  await closeTaskProgress("全部重置完成");
   showToast(getDynamicMessage("allReset"));
 }
 
@@ -7352,18 +9183,23 @@ async function clearAllAppCache() {
   const originalText = button.textContent;
   button.disabled = true;
   button.textContent = language === "en" ? "Clearing…" : "正在清空…";
+  showTaskProgress("正在清空缓存", "清除本地排班数据", 8);
+  await waitForBrowserPaint();
 
   try {
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(UNDO_STORAGE_KEY);
     removeAppSessionStorage();
 
     if (typeof caches !== "undefined" && caches?.keys) {
+      await stepTaskProgress(30, "清理浏览器缓存文件");
       const cacheKeys = await caches.keys();
       const appCacheKeys = cacheKeys.filter(isAppOwnedStorageName);
       await Promise.all(appCacheKeys.map((key) => caches.delete(key)));
     }
 
     if (typeof indexedDB !== "undefined" && typeof indexedDB.databases === "function") {
+      await stepTaskProgress(58, "清理浏览器数据库");
       const databases = await indexedDB.databases();
       const appDatabaseNames = databases
         .map((database) => database?.name)
@@ -7377,6 +9213,7 @@ async function clearAllAppCache() {
     }
 
     if (navigator.serviceWorker?.getRegistrations) {
+      await stepTaskProgress(78, "注销本程序缓存服务");
       const registrations = await navigator.serviceWorker.getRegistrations();
       const appBaseUrl = new URL(".", window.location.href).href;
       const appRegistrations = registrations.filter((registration) => {
@@ -7387,11 +9224,13 @@ async function clearAllAppCache() {
       await Promise.all(appRegistrations.map((registration) => registration.unregister()));
     }
 
+    await stepTaskProgress(92, "重新载入最新版页面");
     const url = new URL(window.location.href);
     url.searchParams.set("cacheReset", Date.now().toString());
     window.location.replace(url.toString());
   } catch (error) {
     console.error("Failed to clear app cache", error);
+    await closeTaskProgress("清空缓存失败", 0);
     const fresh = structuredClone(DEFAULT_STATE);
     state.settings = fresh.settings;
     state.patients = fresh.patients;
@@ -7791,7 +9630,7 @@ function candidateKeepsNurseGroupsValid(machineId, shift, daySchedule, patient, 
     );
 }
 
-function setMachineType(machineId, type) {
+async function setMachineType(machineId, type) {
   const validMachines = new Set(getMachineIds());
   if (!validMachines.has(machineId)) {
     showToast(getDynamicMessage("machineNotInLayout"));
@@ -7799,28 +9638,40 @@ function setMachineType(machineId, type) {
   }
 
   const machineType = normalizeMachineType(type);
-  const issues = getAssignmentCompatibilityIssues(machineId, machineType, getMachineZone(machineId));
-  if (issues.length) {
-    window.alert(`不能修改 ${machineId} 的机器类型。以下现有排班会不匹配，请先移动或清空：\n\n${issues.slice(0, 12).map((item) => `- ${item}`).join("\n")}`);
-    return;
-  }
+  showTaskProgress("正在修改机器类型", "检查现有排班是否兼容", 12);
+  await waitForBrowserPaint();
+  try {
+    const issues = getAssignmentCompatibilityIssues(machineId, machineType, getMachineZone(machineId));
+    if (issues.length) {
+      await closeTaskProgress("机器类型暂不能修改", 0);
+      window.alert(`不能修改 ${machineId} 的机器类型。以下现有排班会不匹配，请先移动或清空：\n\n${issues.slice(0, 12).map((item) => `- ${item}`).join("\n")}`);
+      return;
+    }
 
-  const machineTypes = { ...(state.settings.machineTypes || {}) };
-  if (machineType === DEFAULT_MACHINE_TYPE) {
-    delete machineTypes[machineId];
-  } else {
-    machineTypes[machineId] = machineType;
+    await stepTaskProgress(46, "写入机器类型");
+    const machineTypes = { ...(state.settings.machineTypes || {}) };
+    if (machineType === DEFAULT_MACHINE_TYPE) {
+      delete machineTypes[machineId];
+    } else {
+      machineTypes[machineId] = machineType;
+    }
+    state.settings.machineTypes = normalizeMachineTypeMap(machineTypes, validMachines);
+    saveState();
+    await stepTaskProgress(80, "刷新统计、医护和排班台");
+    renderSummary();
+    renderStaffSchedule();
+    renderSchedule();
+    renderLayoutPreviewFromForm();
+    await closeTaskProgress("机器类型已修改");
+    showToast(`${machineId} 已设为${MACHINE_TYPE_LABELS[machineType]}`);
+  } catch (error) {
+    console.error("修改机器类型失败", error);
+    await closeTaskProgress("修改机器类型失败", 0);
+    window.alert(`修改机器类型失败：${error?.message || error}`);
   }
-  state.settings.machineTypes = normalizeMachineTypeMap(machineTypes, validMachines);
-  saveState();
-  renderSummary();
-  renderStaffSchedule();
-  renderSchedule();
-  renderLayoutPreviewFromForm();
-  showToast(`${machineId} 已设为${MACHINE_TYPE_LABELS[machineType]}`);
 }
 
-function setMachineZone(machineId, zone) {
+async function setMachineZone(machineId, zone) {
   const validMachines = new Set(getMachineIds());
   if (!validMachines.has(machineId)) {
     showToast(getDynamicMessage("machineNotInLayout"));
@@ -7828,29 +9679,41 @@ function setMachineZone(machineId, zone) {
   }
 
   const machineZone = normalizeMachineZone(zone);
-  const issues = getAssignmentCompatibilityIssues(machineId, getMachineType(machineId), machineZone);
-  if (issues.length) {
-    window.alert(`不能修改 ${machineId} 的机器分区。以下现有排班会不匹配，请先移动或清空：\n\n${issues.slice(0, 12).map((item) => `- ${item}`).join("\n")}`);
-    return;
-  }
+  showTaskProgress("正在修改机器分区", "检查现有排班是否兼容", 12);
+  await waitForBrowserPaint();
+  try {
+    const issues = getAssignmentCompatibilityIssues(machineId, getMachineType(machineId), machineZone);
+    if (issues.length) {
+      await closeTaskProgress("机器分区暂不能修改", 0);
+      window.alert(`不能修改 ${machineId} 的机器分区。以下现有排班会不匹配，请先移动或清空：\n\n${issues.slice(0, 12).map((item) => `- ${item}`).join("\n")}`);
+      return;
+    }
 
-  const machineZones = { ...(state.settings.machineZones || {}) };
-  if (machineZone === MACHINE_ZONE_NORMAL) {
-    delete machineZones[machineId];
-  } else {
-    machineZones[machineId] = machineZone;
+    await stepTaskProgress(46, "写入机器分区");
+    const machineZones = { ...(state.settings.machineZones || {}) };
+    if (machineZone === MACHINE_ZONE_NORMAL) {
+      delete machineZones[machineId];
+    } else {
+      machineZones[machineId] = machineZone;
+    }
+    state.settings.machineZones = normalizeMachineZoneMap(machineZones, validMachines);
+    state.settings.specialMachines = getInfectionMachineIds(state.settings);
+    saveState();
+    await stepTaskProgress(80, "刷新统计、医护和排班台");
+    renderSummary();
+    renderStaffSchedule();
+    renderSchedule();
+    renderLayoutPreviewFromForm();
+    await closeTaskProgress("机器分区已修改");
+    showToast(`${machineId} 已设为${getMachineZoneLabel(machineId)}`);
+  } catch (error) {
+    console.error("修改机器分区失败", error);
+    await closeTaskProgress("修改机器分区失败", 0);
+    window.alert(`修改机器分区失败：${error?.message || error}`);
   }
-  state.settings.machineZones = normalizeMachineZoneMap(machineZones, validMachines);
-  state.settings.specialMachines = getInfectionMachineIds(state.settings);
-  saveState();
-  renderSummary();
-  renderStaffSchedule();
-  renderSchedule();
-  renderLayoutPreviewFromForm();
-  showToast(`${machineId} 已设为${getMachineZoneLabel(machineId)}`);
 }
 
-function togglePausedMachine(machineId) {
+async function togglePausedMachine(machineId) {
   const validMachines = new Set(getMachineIds());
   if (!validMachines.has(machineId)) {
     showToast(getDynamicMessage("machineNotInLayout"));
@@ -7874,14 +9737,24 @@ function togglePausedMachine(machineId) {
   } else {
     paused.delete(machineId);
   }
-  state.settings.pausedMachines = normalizeMachineIdList([...paused], validMachines);
-  saveState();
-  renderSummary();
-  renderStaffSchedule();
-  renderSchedule();
-  renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
-  renderLayoutPreviewFromForm();
-  showToast(willPause ? `${machineId} 号机已暂停` : `${machineId} 号机已恢复`);
+  showTaskProgress(willPause ? "正在暂停机器" : "正在恢复机器", "写入机器状态", 16);
+  await waitForBrowserPaint();
+  try {
+    state.settings.pausedMachines = normalizeMachineIdList([...paused], validMachines);
+    saveState();
+    await stepTaskProgress(74, "刷新统计、排班台和固定机位选项");
+    renderSummary();
+    renderStaffSchedule();
+    renderSchedule();
+    renderPatientFixedMachineOptions(ui.patientFixedMachine?.value || "");
+    renderLayoutPreviewFromForm();
+    await closeTaskProgress(willPause ? "机器已暂停" : "机器已恢复");
+    showToast(willPause ? `${machineId} 号机已暂停` : `${machineId} 号机已恢复`);
+  } catch (error) {
+    console.error("修改机器暂停状态失败", error);
+    await closeTaskProgress("修改机器状态失败", 0);
+    window.alert(`修改机器状态失败：${error?.message || error}`);
+  }
 }
 
 function countAssignmentsForMachine(machineId) {
@@ -7891,7 +9764,7 @@ function countAssignmentsForMachine(machineId) {
   }, 0);
 }
 
-function toggleInactiveSlot(slotKey) {
+async function toggleInactiveSlot(slotKey) {
   const validSlots = new Set(getAllSlotKeys());
   if (!validSlots.has(slotKey)) {
     showToast(getDynamicMessage("slotNotInLayout"));
@@ -7909,26 +9782,37 @@ function toggleInactiveSlot(slotKey) {
     return;
   }
 
-  const oldAttributes = getMachineAttributesBySlot(getMachineSlots());
-  if (isRemoving) {
-    inactiveSlots.add(slotKey);
-  } else {
-    inactiveSlots.delete(slotKey);
-  }
+  showTaskProgress(isRemoving ? "正在删除机位" : "正在恢复机位", "保存原有机器属性", 14);
+  await waitForBrowserPaint();
+  try {
+    const oldAttributes = getMachineAttributesBySlot(getMachineSlots());
+    if (isRemoving) {
+      inactiveSlots.add(slotKey);
+    } else {
+      inactiveSlots.delete(slotKey);
+    }
 
-  const nextSettings = {
-    ...state.settings,
-    inactiveSlots: normalizeInactiveSlots([...inactiveSlots], state.settings),
-  };
-  const nextSlots = getMachineSlots(nextSettings);
-  state.settings.inactiveSlots = nextSettings.inactiveSlots;
-  applyMachineAttributesBySlot(oldAttributes, nextSlots);
-  saveState();
-  renderSummary();
-  renderStaffSchedule();
-  renderSchedule();
-  renderLayoutPreviewFromForm();
-  showToast(isRemoving ? "机位已删除，机器已重新编号" : "机位已恢复，机器已重新编号");
+    await stepTaskProgress(46, "重新计算机器编号和分区");
+    const nextSettings = {
+      ...state.settings,
+      inactiveSlots: normalizeInactiveSlots([...inactiveSlots], state.settings),
+    };
+    const nextSlots = getMachineSlots(nextSettings);
+    state.settings.inactiveSlots = nextSettings.inactiveSlots;
+    applyMachineAttributesBySlot(oldAttributes, nextSlots);
+    saveState();
+    await stepTaskProgress(80, "刷新统计、医护和排班台");
+    renderSummary();
+    renderStaffSchedule();
+    renderSchedule();
+    renderLayoutPreviewFromForm();
+    await closeTaskProgress(isRemoving ? "机位已删除" : "机位已恢复");
+    showToast(isRemoving ? "机位已删除，机器已重新编号" : "机位已恢复，机器已重新编号");
+  } catch (error) {
+    console.error("修改机位失败", error);
+    await closeTaskProgress("修改机位失败", 0);
+    window.alert(`修改机位失败：${error?.message || error}`);
+  }
 }
 
 function getMachineAttributesBySlot(slots) {
@@ -8485,6 +10369,11 @@ function getPatientCompatibilityIssues(patient) {
 
   Object.entries(state.weeklySchedules || {}).forEach(([dayKey, daySchedule]) => {
     scanDay(`周模板${getWeekDayLabel(dayKey)}`, daySchedule);
+  });
+  ["week1", "week2"].forEach((weekKey, index) => {
+    Object.entries(state.twoWeekCycle?.patientSchedules?.[weekKey] || {}).forEach(([dayKey, daySchedule]) => {
+      scanDay(`2周循环第${index + 1}周${getWeekDayLabel(dayKey)}`, daySchedule);
+    });
   });
   Object.entries(state.schedules || {}).forEach(([date, daySchedule]) => {
     scanDay(`${formatDateLabel(date)}`, daySchedule);

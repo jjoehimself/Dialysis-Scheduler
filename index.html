@@ -8,7 +8,7 @@
 <meta content="no-cache" http-equiv="Pragma"/>
 <meta content="0" http-equiv="Expires"/>
 <title>血透室本地排班系统</title>
-<link href="styles.css?v=20260619-person-card-report" rel="stylesheet"/>
+<link href="styles.css?v=20260621-scrollbars" rel="stylesheet"/>
 </head>
 <body>
 <div class="app-shell">
@@ -21,6 +21,14 @@
 <label class="header-language-control" title="Language">
 <span class="sr-only">Language</span>
 <select aria-label="Language" id="languageSelect"></select>
+</label>
+<label class="header-theme-control" title="界面主题">
+<span class="sr-only">界面主题</span>
+<select aria-label="界面主题" id="themeSelect">
+<option value="light">明亮</option>
+<option value="eye">护眼绿</option>
+<option value="dark">暗黑</option>
+</select>
 </label>
 </div>
 <p id="storageStatus"><span data-i18n="static_003">本地自动保存，打开后自动读取</span></p>
@@ -90,10 +98,12 @@
 <div class="board-actions">
 <div class="cycle-actions-inline">
 <button class="primary-button" id="generateTwoWeekPlan" type="button">生成2周排班</button>
-      <button class="ghost-button" id="openInsertPatient" type="button">临时插入患者</button>
       <button class="ghost-button" id="saveTwoWeekTemplate" type="button">保存为长期2周循环模板</button>
       <button class="ghost-button" id="openTwoWeekReview" type="button">生成当前2周排班报告</button>
+      <button class="ghost-button self-check-button" id="runScheduleSelfCheck" type="button">排班自检</button>
+      <button class="ghost-button undo-button" id="undoLastChange" type="button" disabled>撤销上一步</button>
 </div>
+<button class="success-button shift-swap-button" id="openShiftSwap" type="button">智能调班</button>
 <label class="schedule-priority-control">
 <span id="schedulePriorityLabel"><span data-i18n="static_021">排班策略</span></span>
 <select id="schedulePriority">
@@ -178,7 +188,7 @@
 </label>
 <label>
 <span><span data-i18n="static_052">每月血滤次数</span></span>
-<input id="monthlyHdfCount" max="4" min="0" type="number" value="1"/>
+<input id="monthlyHdfCount" max="4" min="0" type="number" value="2"/>
 <small class="field-hint"><span data-i18n="static_053">仅用于常规血透患者；血滤或灌流患者不再另行生成月度血滤。</span></small>
 </label>
 <label>
@@ -410,7 +420,7 @@
 <div class="form-grid two">
 <label>
 <span><span data-i18n="static_130">患者数量</span></span>
-<input id="demoPatientCount" max="300" min="0" type="number" value="36"/>
+<input id="demoPatientCount" max="300" min="0" type="number" value="194"/>
 </label>
 <label>
 <span><span data-i18n="static_131">医生数量</span></span>
@@ -418,7 +428,7 @@
 </label>
 <label>
 <span><span data-i18n="static_132">护士数量</span></span>
-<input id="demoNurseCount" max="200" min="0" type="number" value="10"/>
+<input id="demoNurseCount" max="200" min="0" type="number" value="21"/>
 </label>
 <label>
 <span><span data-i18n="static_133">HBC 患者数量</span></span>
@@ -426,23 +436,23 @@
 </label>
 <label>
 <span><span data-i18n="static_134">HBV 患者数量</span></span>
-<input id="demoHbvCount" max="300" min="0" type="number" value="2"/>
+<input id="demoHbvCount" max="300" min="0" type="number" value="24"/>
 </label>
 <label>
 <span><span data-i18n="static_135">HCV 患者数量</span></span>
-<input id="demoHcvCount" max="300" min="0" type="number" value="1"/>
+<input id="demoHcvCount" max="300" min="0" type="number" value="0"/>
 </label>
 <label>
 <span><span data-i18n="static_136">T 患者数量</span></span>
-<input id="demoTCount" max="300" min="0" type="number" value="1"/>
+<input id="demoTCount" max="300" min="0" type="number" value="4"/>
 </label>
 <label>
 <span><span data-i18n="static_137">严重组患者数量</span></span>
-<input id="demoSevereCount" max="300" min="0" type="number" value="4"/>
+<input id="demoSevereCount" max="300" min="0" type="number" value="80"/>
 </label>
 <label>
-<span><span data-i18n="static_138">演示每月血滤次数</span></span>
-<input id="demoMonthlyHdfCount" max="4" min="0" type="number" value="1"/>
+<span><span data-i18n="static_138">演示每4周血滤次数</span></span>
+<input id="demoMonthlyHdfCount" max="4" min="0" type="number" value="2"/>
 </label>
 </div>
 <div class="form-actions">
@@ -645,7 +655,7 @@
 </label>
 <label>
 <span>每4周血滤次数</span>
-<input max="4" min="0" name="monthlyHdfCount" type="number" value="1"/>
+<input max="4" min="0" name="monthlyHdfCount" type="number" value="2"/>
 <small class="field-hint">仅用于常规血透患者；血滤或灌流患者不再另行生成月度血滤。</small>
 </label>
 <label>
@@ -710,8 +720,67 @@
 </div>
 </form>
 </dialog>
+<dialog class="assignment-dialog shift-swap-dialog" id="shiftSwapDialog">
+<form id="shiftSwapForm" method="dialog">
+<div class="dialog-header">
+<div>
+<h2>智能调班</h2>
+<p>让某位护士连续休息；别人先替她上班，系统再安排她后面等量补回。</p>
+</div>
+<button aria-label="关闭" class="icon-button" id="closeShiftSwapDialog" type="button">×</button>
+</div>
+<div class="form-grid two shift-swap-grid">
+<label>
+<span>需要休息的护士</span>
+<select id="shiftSwapTarget" required></select>
+</label>
+<label>
+<span>从哪天开始</span>
+<input id="shiftSwapStartDate" required type="date"/>
+</label>
+<label>
+<span>连续休息天数</span>
+<input id="shiftSwapDays" max="31" min="1" required type="number" value="7"/>
+</label>
+<label>
+<span>调班方式</span>
+<select id="shiftSwapMode">
+<option value="specified">只用指定调班人</option>
+<option value="auto">系统自动找人</option>
+</select>
+</label>
+</div>
+<fieldset class="shift-swap-candidates">
+<legend>指定调班人</legend>
+<p id="shiftSwapCandidateHint">如果选择“只用指定调班人”，请勾选已经和该护士说好的人员；如果选择“系统自动找人”，这里可以不勾选。</p>
+<div class="shift-swap-candidate-list" id="shiftSwapCandidates"></div>
+</fieldset>
+<div class="shift-swap-note">
+系统会先列出“谁替她”和“她后面替谁补回来”；确认后保存为具体日期的医护排班覆盖，不会改患者排班、机位和长期2周模板。
+</div>
+<div class="dialog-actions">
+<span class="insert-dialog-hint">适合请假、连续休息、临时换班等情况。</span>
+<div>
+<button class="ghost-button" data-shift-swap-cancel type="button">取消</button>
+<button class="success-button" type="submit">生成调班方案</button>
+</div>
+</div>
+</form>
+</dialog>
+<dialog class="schedule-review-dialog shift-swap-result-dialog" id="shiftSwapResultDialog">
+  <div class="schedule-review-shell shift-swap-result-shell">
+    <div class="dialog-header schedule-review-header">
+      <div>
+        <h2 id="shiftSwapResultTitle">智能调班明细</h2>
+        <p id="shiftSwapResultMeta">请护士长核对：谁替班、谁补班、日期和班次是否正确。</p>
+      </div>
+      <button class="ghost-button" id="closeShiftSwapResult" type="button">关闭</button>
+    </div>
+    <div class="schedule-review-content" id="shiftSwapResultContent"></div>
+  </div>
+</dialog>
 <div aria-live="polite" class="toast" id="toast" role="status"></div>
 <script src="languages.js?v=20260617-28"></script>
-<script src="app.js?v=20260619-person-card-report"></script>
+<script src="app.js?v=20260621-scrollbars"></script>
 </body>
 </html>
