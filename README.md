@@ -1,474 +1,228 @@
-# 血透室本地排班系统
-# Hemodialysis Room Local Scheduler
+# Dialysis-Scheduler
 
-## 全免费 · 全开源 · 全本地 · 超简单
-## Completely Free · Fully Open Source · 100% Local · Easy to Use
+Privacy-friendly local scheduling assistant for hemodialysis rooms.
 
+Dialysis-Scheduler is a free, open-source, local-first scheduling tool for dialysis units. It runs directly in the browser with plain HTML, CSS, and JavaScript. It does not require a server, database, account system, or internet connection. Patient records, staff records, machine layouts, recurring schedules, and date-specific adjustments stay on the local computer by default.
 
-一款面向血液透析中心的本地排班辅助软件。
+This project was created by a dialysis patient to reduce repetitive scheduling work, make fixed patient seats easier to manage, and give nurses and administrators a clearer way to review hemodialysis-room schedules before use.
 
-本项目完全免费、完全开源，无需安装服务器，无需部署数据库，也不需要联网使用。
+## Why This Matters
 
-你只需要下载项目中的全部文件，将它们放在同一个文件夹内，然后双击运行 `index.html`，即可开始使用。
+Hemodialysis scheduling is difficult because it is not just a calendar problem. Real dialysis rooms must consider patient frequency, fixed machine positions, morning and afternoon shifts, infection isolation, severe-care areas, machine failures, treatment-machine compatibility, nurse capacity, doctor coverage, and temporary changes.
 
-患者资料、医护资料、机器布局、排班模板和日常调整数据，全部保存在当前电脑的浏览器本地，不会自动上传到任何服务器。
+Many small or resource-limited dialysis units still manage these constraints manually. Dialysis-Scheduler aims to provide a transparent, inspectable, low-cost tool that keeps sensitive data local and always leaves final decisions to healthcare staff.
 
-系统支持：
+## Key Features
 
-* 患者长期固定机位
-* 患者优先、医护优先和灵巧排班
-* 上午、下午独立排班
-* 血透、血滤、灌流机型严格区分
-* 普通区、重病区和传染病区隔离
-* 重病区每5名患者配置1名护士
-* 其他区域每6名患者配置1名护士
-* 每名护士最多负责1台血滤机
-* 护士责任管区禁止跨越不同机器排
-* 机器故障暂停和临时调整
-* 长期周模板和单日调整
-* 护士负担均衡
-* 灵巧透析日组合优化
-* 自动安全检查和错误提示
-* 多语言界面
-* 本地数据导入、导出和备份
+- Fully local browser app: open `index.html` and use it without a backend.
+- Patient, staff, and machine management.
+- Long-term fixed machine positions for patients.
+- Two-week recurring scheduling cycle.
+- Morning and afternoon shift scheduling.
+- Patient Priority, Staff Priority, and Smart Scheduling modes.
+- Strict treatment-machine matching for hemodialysis, hemofiltration, and hemoperfusion.
+- Standard, severe-care, shared infection, HBV, HCV, HBC, and T-zone separation.
+- Severe-care nurse ratio: 1 nurse per 5 patients.
+- Standard-area nurse ratio: 1 nurse per 6 patients.
+- No more than 1 hemofiltration machine per responsible nurse.
+- Nurse responsibility zones kept within physical machine rows.
+- Machine pause and failure handling.
+- Temporary patient insertion without moving existing patients.
+- Smart staff shift swapping for leave and short-term coverage.
+- Safety self-check before long-term use.
+- Printable schedule and review reports.
+- JSON import, export, and backup.
+- Demo data generation for testing and training.
+- Multilingual UI, including LTR and RTL language support.
+- Light, eye-comfort, and dark themes.
 
-作者本人是一名透析患者。
+## Quick Start
 
-本项目希望在保证安全规则和人工复核的前提下，帮助血透中心减少重复操作，提高排班效率，让患者更容易找到固定机位，也让医护人员的工作安排更加清晰和均衡。
+1. Download the repository files.
+2. Keep these files in the same folder:
+   - `index.html`
+   - `app.js`
+   - `styles.css`
+   - `languages.js`
+3. Double-click `index.html`.
+4. Configure the machine layout, patients, staff, and scheduling strategy.
+5. Generate a schedule, review the report, then export a JSON backup.
 
-本程序完全开源，完全免费。
+No installation is required.
 
-感谢世界上所有的医护人员，希望你们每天都开开心心，健健康康。
+## Local-First Privacy Design
 
-如有功能需求、使用建议或问题反馈，欢迎联系：
+Dialysis-Scheduler does not automatically upload patient or staff data to any server. The default storage is the current browser's `localStorage` on the local computer.
 
-**[434881918@qq.com](mailto:434881918@qq.com)**
+Important notes:
 
-作者：**捉云**
+- Export JSON backups regularly.
+- Do not publish real patient data in GitHub issues.
+- Clear local data before sharing a computer.
+- For institutional use, add access control, audit logs, secure backups, and internal privacy review.
 
-<img width="963" height="1705" alt="image" src="https://github.com/user-attachments/assets/e79d1a0d-6d84-4aa8-915c-20fa01cf086f" />
+## Scheduling Rules
 
+### Machine Types
+
+The system treats treatment-machine compatibility as a hard rule:
+
+| Treatment | Required machine |
+|---|---|
+| Hemodialysis | Hemodialysis machine |
+| Hemofiltration | Hemofiltration machine |
+| Hemoperfusion | Hemoperfusion machine |
+
+The program does not silently convert one machine type into another.
+
+### Zones
+
+The default layout supports standard, severe-care, and infectious-disease separation.
+
+| Zone | Purpose |
+|---|---|
+| Standard zone | Routine non-infectious patients |
+| Severe-care zone | Severe-care or high-attention patients |
+| Shared infection zone | General infectious isolation area |
+| HBV / HCV / HBC / T zones | Specific infectious-disease separation |
+
+Infectious patients must be assigned to a compatible infection zone. Non-infectious patients are kept out of infection zones.
+
+### Staff Rules
+
+- Each active shift requires doctor coverage.
+- Each active shift requires responsible nurses based on patient load.
+- A backup nurse can be assigned.
+- Responsible nurses must not be duplicated in the same shift.
+- A backup nurse must not also be a responsible nurse in the same shift.
+- Nurse groups are checked for load, row boundaries, severe-care capacity, and hemofiltration-machine count.
+
+## Safety Self-Check
+
+The self-check report looks for problems such as:
+
+- Missing patient sessions.
+- Duplicate patient scheduling on the same day.
+- Incompatible treatment and machine type.
+- Infection-zone mismatch.
+- Severe-care and standard-area capacity problems.
+- Paused machines still being used.
+- Invalid or inactive staff references.
+- Missing doctor, nurse, or backup nurse coverage.
+- Long-term fixed machine conflicts.
+
+The report is designed for human review. It is not a clinical decision system.
+
+## Screenshots
+
+Recommended screenshots to add before submitting grant or open-source support applications:
+
+- Main schedule board.
+- Two-week schedule review report.
+- Patient library.
+- Staff schedule board.
+- Machine layout editor.
+- Safety self-check report.
+
+Place images in a `docs/images/` folder and reference them here.
+
+## Project Status
+
+This project is under active development. It is suitable for local testing, workflow exploration, and open-source collaboration. Before use in a real healthcare institution, it should be reviewed by clinical, nursing, infection-control, IT, and privacy teams.
+
+## Roadmap
+
+See `ROADMAP.md`.
+
+## Contributing
+
+Contributions are welcome. Please read `CONTRIBUTING.md` before opening issues or pull requests.
+
+Do not include real patient information in any public issue, pull request, screenshot, demo file, or discussion.
+
+## Security
+
+Please read `SECURITY.md` for privacy and vulnerability reporting guidance.
+
+## License
+
+This project is released under the MIT License.
 
 ---
 
-# Hemodialysis Room Local Scheduler
+# 血透室本地排班系统
 
-## Completely Free · Fully Open Source · 100% Local · Easy to Use
+面向血液透析室的隐私友好、本地优先、免费开源排班辅助工具。
 
-A local scheduling-assistance system designed for hemodialysis centers.
+Dialysis-Scheduler 使用原生 HTML、CSS、JavaScript 编写，直接在浏览器中运行。它不需要服务器、数据库、账号系统或网络连接。患者资料、医护资料、机器布局、长期模板和单日调整默认保存在当前电脑浏览器本地。
 
-This project is completely free and fully open source. It requires no server installation, no database deployment, and no internet connection.
+本项目由透析患者创建，目标是在保留人工复核和安全规则的前提下，帮助血透室减少重复排班工作，让患者固定机位更清晰，也让医护排班更容易检查和调整。
 
-Simply download all project files, place them in the same folder, and double-click `index.html` to start using the system.
+## 项目价值
 
-Patient records, staff information, machine layouts, recurring weekly templates, and date-specific schedule adjustments are stored locally in the browser on the current computer. No data is automatically uploaded to any server.
+血透室排班不是简单的日历问题。真实场景中需要同时处理患者透析频率、固定机位、上午/下午班次、传染病隔离、重病区、机器故障、血透/血滤/灌流机型匹配、护士责任区、医生覆盖和临时调整。
 
-The system supports:
+很多中小型或资源有限的透析单位仍然依靠手工方式处理这些复杂约束。本项目希望提供一个透明、可检查、低成本、数据本地保存的开源工具，并且始终保留医护人员最终复核。
 
-* Long-term fixed machine positions for patients
-* Patient Priority, Staff Priority, and Smart Scheduling modes
-* Separate morning and afternoon scheduling
-* Strict separation of hemodialysis, hemofiltration, and hemoperfusion machines
-* Isolation of standard, severe-care, and infectious-disease zones
-* One nurse for every 5 severe-care patients
-* One nurse for every 6 patients in other zones
-* No more than one hemofiltration machine per nurse
-* Nurse responsibility zones that never cross physical machine rows
-* Machine pause and failure handling
-* Recurring weekly templates and date-specific adjustments
-* Balanced nurse workloads
-* Flexible and safe treatment-day pattern optimization
-* Automatic safety checks and error warnings
-* Multilingual interface
-* Local data import, export, and backup
+## 主要功能
 
-The author is a dialysis patient.
+- 纯本地浏览器运行，打开 `index.html` 即可使用。
+- 患者库、医护库、机器布局管理。
+- 患者长期固定机位。
+- 长期 2 周循环排班。
+- 上午、下午独立班次。
+- 患者优先、医护优先、灵巧排班三种策略。
+- 血透、血滤、灌流机型严格匹配。
+- 普通区、重病区、通用传染区、HBV、HCV、HBC、T 区隔离。
+- 重病区 5 名患者配置 1 名护士。
+- 其他区域 6 名患者配置 1 名护士。
+- 每名责任护士最多负责 1 台血滤机。
+- 护士责任区不跨越物理机器排。
+- 机器故障暂停与恢复。
+- 临时插入患者，不移动已排好的患者。
+- 智能调班，适合请假和短期替班。
+- 排班自检和人工复核报告。
+- 打印排班和复核报告。
+- JSON 导入、导出和备份。
+- 演示数据生成，便于测试和培训。
+- 多语言界面，支持 LTR 和 RTL 语言。
+- 明亮、护眼绿、暗黑主题。
 
-This project aims to help hemodialysis centers reduce repetitive work, improve scheduling efficiency, make fixed patient positions easier to manage, and create clearer and more balanced workloads for healthcare staff, while preserving mandatory safety rules and manual review.
+## 使用方法
 
-This program is fully open source and completely free.
+1. 下载项目文件。
+2. 确认以下文件在同一个文件夹：
+   - `index.html`
+   - `app.js`
+   - `styles.css`
+   - `languages.js`
+3. 双击打开 `index.html`。
+4. 设置机器布局、患者、医护和排班策略。
+5. 生成排班，复核报告，然后导出 JSON 备份。
 
-Thank you to all healthcare workers around the world. May you be happy and healthy every day.
+无需安装。
 
-For feature requests, suggestions, or issue reports, please contact:
+## 本地隐私设计
 
-**[434881918@qq.com](mailto:434881918@qq.com)**
+程序不会自动上传患者或医护数据。默认数据保存在当前电脑浏览器的 `localStorage` 中。
 
-Author: **Zhuo Yun**
+使用提醒：
 
+- 定期导出 JSON 备份。
+- 不要在 GitHub issue 中上传真实患者资料。
+- 共用电脑前请清理本地数据。
+- 医疗机构正式使用前，应补充账号权限、审计日志、安全备份和院内隐私审查。
 
-<img width="2610" height="1778" alt="image" src="https://github.com/user-attachments/assets/eb9edcdc-bf21-4e19-9c3d-9aedb3cd0024" />
+## 安全说明
 
+本项目是排班辅助工具，不是医疗诊断系统，也不是经过认证的临床决策系统。所有排班结果都必须由医护人员人工复核后再执行。
 
+## 贡献
 
+欢迎提出 issue 和 pull request。请先阅读 `CONTRIBUTING.md`。
 
+公开交流中请勿包含任何真实患者身份信息、联系方式、病历内容或截图。
 
+## 许可证
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-# 血透室排班系统
-
-**版本：2026.06.17.2（全面修复版）**
-
-这是一个使用原生 HTML、CSS、JavaScript 编写的本地血透室排班工具。无需安装服务器、数据库、Node.js 或 Python，把文件放在同一目录后直接打开 `index.html` 即可运行。
-
-> 正式录入数据前，建议先确认默认布局，再定期使用“导出”保存 JSON 备份。
-
-## 默认 60 台机器布局
-
-默认采用 **6 排 × 10 台，共 60 台机器**：
-
-| 机器编号 | 默认类型与区域 |
-|---|---|
-| 1 | 血滤，HBV 区 |
-| 2—7 | 血透，HBV 区 |
-| 8 | 血透，HCV 区 |
-| 9 | 血透，T 区 |
-| 10 | 血滤，T 区 |
-| 11、41、50、51 | 血滤，普通区 |
-| 21、30、31、40 | 血滤，重病区 |
-| 21—40 其余机器 | 血透，重病区 |
-| 其余机器 | 血透，普通区 |
-
-机器类型严格固定：
-
-- 血透治疗只能进入血透机。
-- 血滤治疗只能进入血滤机。
-- 灌流治疗只能进入灌流机。
-- 不存在血滤机临时改做血透、或血透机临时改做血滤的逻辑。
-
-## 核心排班规则
-
-### 分区
-
-- 普通区与重病区都属于非传染区域，容量不足时可以互相调配。
-- 普通患者优先安排普通区，严重组患者优先安排重病区。
-- HBV、HCV、HBC、T 与通用传染区同非传染区严格分开。
-- 传染患者只能进入对应传染区或通用传染区。
-- 不同传染分类不会被合并到同一责任护士区域。
-
-### 责任护士
-
-- 重病区：每 **5 名当班患者**配置 1 名责任护士。
-- 其他区域：每 **6 名当班患者**配置 1 名责任护士。
-- 两类患者分别计算，不能混合抵扣。
-- 每名责任护士最多负责 **1 台血滤机**。
-- 责任机位按实际布局尽量连续、相邻，减少跨区和远距离管理。
-- 空班次不再显示虚假的医护岗位；上午、下午分别按实际患者数量计算。
-- 每个有患者的班次默认需要 2 名医生和 1 名后备护士。
-
-### 长期固定机位
-
-- 首次成功生成周模板时，系统为未固定患者确定长期机位。
-- 后续周模板优先并严格沿用长期固定机位。
-- 临时故障、消毒或特殊情况使用“仅当前日期”调整，不改变长期机位。
-- 固定血透机不支持某次月度血滤时，仅该次临时换到对应血滤机，之后返回原固定血透机。
-
-### 排班策略
-
-- **病人优先**：尽量保持患者原来的星期、班次和长期固定机位，医护跟随患者排班。
-- **医护优先**：尽量把患者集中到较少的开班日和班次，让更多空班次不安排医护，同时仍遵守机器类型、分区、固定机位和护士比例等硬规则。
-
-## 周模板与单日调整
-
-- **周模板**：长期重复使用的基础排班，例如每周一、三、五上午固定在 31 号机。
-- **仅当前日期**：只修改某个具体日期，用于请假、补透、临时换机、机器故障、节假日调整和月度血滤。
-- 单日调整优先于周模板，但不会改变以后的固定排班。
-
-## 机器暂停
-
-在“布局设置”中选择“暂停/恢复机器（故障）”，再点击机器：
-
-- 暂停不会删除机器，也不会改变编号、类型、分区或长期固定关系。
-- 自动排班会绕开暂停机器。
-- 已经排在暂停机器上的患者会显示警告，需要重新生成或人工调整。
-- 恢复机器后，可重新生成排班让固定患者回到原机位。
-
-## 月度血滤
-
-- “每月血滤次数”只用于**常规治疗为血透**的患者。
-- 常规治疗已经是血滤或灌流时，该项自动设为 0，避免把治疗类型混在一起。
-- 月度血滤生成未来 4 周的日期调整，不写入永久周模板。
-- 再次生成周模板时，系统会先清理上一轮自动生成的月度血滤调整，避免重复累积；人工创建的单日调整会保留。
-
-## 演示数据
-
-可分别填写以下模拟患者数量：
-
-- HBC
-- HBV
-- HCV
-- T
-- 严重组
-
-传染患者总数不能超过患者总数。默认布局没有 HBC 专用机器，因此 HBC 默认数量为 0；需要演示 HBC 时，应先设置 HBC 区机器。
-
-## 数据管理
-
-- 数据保存在当前浏览器的 `localStorage` 中。
-- “全部重置”只重置本程序业务数据并恢复默认布局。
-- “清空所有缓存”会删除本程序保存的数据、清除本程序专用缓存并强制重新载入页面；不会主动清除同一网站其他程序的数据。
-- 清缓存、重置或更换电脑前，请先导出 JSON 备份。
-- 导入功能会先验证文件是否包含本程序的数据结构，避免误把普通 JSON 当作排班备份导入。
-- 检测到损坏的旧缓存时，程序会恢复默认数据并显示提示，不再反复启动失败。
-
-## 本次全面修复
-
-本版本重点修复了以下问题：
-
-1. 修复排班策略、机器暂停等界面元素缺失导致的启动错误。
-2. 恢复并锁定用户指定的 6×10 默认 60 台布局。
-3. 修复血透、血滤、灌流之间错误兼容的问题，改为严格一一对应。
-4. 修复重病区与其他区域护士人数计算混用的问题。
-5. 修复一名护士可能负责多台血滤机或跨传染分类的问题。
-6. 修复医护排班被无故扩展成大量空护士岗位的问题。
-7. 修复空班次仍显示医生、护士和后备护士岗位的问题。
-8. 修复旧排班缺少治疗类型、孤儿患者记录、无效机器编号仍被保留的问题。
-9. 修复月度血滤重复生成、旧自动日期调整长期累积的问题。
-10. 修复修改布局、机器类型或分区时可能让已有排班失效的问题，并增加兼容性检查。
-11. 修复损坏缓存导致程序持续无法正常启动的问题。
-12. 优化自动排班候选机器搜索，降低较多患者时的计算耗时。
-13. 增加“清空所有缓存”按钮，并采用应用范围清理，避免误删其他程序存储。
-14. 清理不可达旧代码，并增加 HTML 与 JavaScript 版本不一致时的明确提示。
-
-## 已执行检查
-
-- JavaScript 语法检查。
-- HTML 解析、重复 ID 与缺失控件检查。
-- 默认 60 台布局检查。
-- 严格机器类型匹配测试。
-- 重病区 5 人/护士、其他区 6 人/护士测试。
-- 每名护士最多 1 台血滤机测试。
-- 传染分类责任区隔离测试。
-- 固定机位、暂停机器及临时替代机位测试。
-- 月度血滤生成与旧自动调整清理测试。
-- 演示数据自动排班测试。
-- 医护自动排班与同班重复检查。
-- 本程序缓存清理范围测试。
-
-## 文件结构
-
-```text
-.
-├── index.html
-├── app.js
-├── styles.css
-├── README.md
-└── README_GitHub_中英双语.md
-```
-
-## 使用提醒
-
-该项目目前是本地排班与演示工具，不是医疗诊断或临床决策系统。正式用于医疗机构前，应由科室负责人、护理管理、院感和信息部门共同审核，并补充账号权限、审计日志、自动备份、院内数据库和隐私保护。
-
-- 首页概览卡片采用更高可视化的看板样式，增加颜色分组、进度条和分类标签，便于快速查看机器、患者与医护状态。
-
-- 顶部标题更新为“血透室本地排班系统”，并新增“关于作者和程序”按钮，点击后弹出作者说明。
-
-
-## 长期周模板说明
-
-- “生成长期周模板建议”会一次生成周一至周六的完整排班，并直接保存为以后每周循环使用的长期模板。
-- “本周设为长期模板”会把当前显示这一周的周一至周六患者排班和医护排班，整体转换为长期循环模板，不再只保存某一天。
-- 当前周内已有的单日调整会随本周排班写入长期模板，保存后对应日期的临时调整会被移除。
-- 周日默认休息，周日临时加班仍只作为单日调整，不进入长期模板。
-
-
-## 稳定回退修复版说明
-
-- 本版基于已验证可正常生成和显示排班的稳定版本回退整理。
-- 暂时移除后续实验性的护士图形化区域改造，优先保证“点击生成后能正常显示排班”。
-- 等基础功能稳定后，再继续做新的护士图形化显示。
-
-
-## 护士管区图稳定版
-
-- 本版以稳定回退修复版为基础，只修改显示层，不改自动排班、周模板、固定机位等核心逻辑。
-- 机器排班上方新增独立“护士管区图”。
-- 每名护士姓名仅显示一次，下面直接显示其负责机器编号，例如“王一帆 / 1 2 3 4 5 6”。
-- 不同护士使用不同颜色；对应机器的上午/下午卡片左侧使用同色标识。
-- 机器卡片及生成结果保持原有结构，避免再次影响排班显示。
-
-
-## 班次合并对齐版
-
-- 每排改为“上午护士管区 → 上午机器排班 → 下午护士管区 → 下午机器排班”。
-- 每个护士管区卡片按其负责机器的首列和末列自动拉伸，与下面对应机器列严格对齐。
-- 自动排班、固定机位、护士分组等核心逻辑未修改，本次仅调整显示层。
-
-- 首页新增“治疗能力总览”：显示单班最大人数、每日/每周最大治疗人次、按每周3次折算的患者容量、当前周需求与剩余容量、今日利用率，以及血滤日最大能力。
-
-- 治疗能力总览改为与原概览卡片一致的紧凑尺寸，不再横跨整行；内部数据改为小型网格展示。
-
-- 治疗能力总览固定在首页第一行第四个普通卡片位置，尺寸与“排班策略/机器总览/机型配置”一致。
-
-- 护士管区改为单行紧凑模式：不再固定按上午/下午上下分开，系统会把上午与下午的护士管区按“尽量少行”的方式压缩显示；下方机器卡片恢复为单卡片内同时显示上午和下午，减少整体高度。
-
-- 护士管区调整为“上午/下午左右分栏”模式：上午与下午仍然明确分开，但优先并排左右显示，减少纵向占用；若屏幕过窄再自动换成上下。
-- “第几排”标题进一步变细：缩小字号、降低字重、减轻颜色。
-
-- “第几排”标题增加竖向强调条和渐变分隔线；相邻排之间增加更明确的横向分隔，保持字号细致但层级更醒目。
-
-- 上午与下午现已严格分开：每一排拆成左右两栏，左栏仅显示上午护士管区与上午机位，右栏仅显示下午护士管区与下午机位，不再在同一张机位卡里上下混排。
-
-- 上午下午改为上下双栏：每一排先显示完整上午区块，再显示完整下午区块；两者纵向分开，并增加中间分隔线。
-
-- 修复同一班次内护士管区明明不重叠却被排成上下两行的问题：现按起始机位从左到右排序，并强制同一班次管区优先放在同一行。
-
-- 强化“第几排”视觉效果：加粗竖向色条、加厚横向渐变分隔线，并给“第X排”文字增加浅色标签底，使排标题更醒目。
-
-
-## 2026.06.17.20 全面安全修复与优化
-
-- 自动生成周模板保存前新增硬性安全审计。
-- 新增同一患者同一天跨上午/下午重复安排检测。
-- 检查暂停机器、机型严格匹配、传染分区、固定机位、护士容量、每名护士最多一台血滤机。
-- 检查医生、责任护士、后备护士数量、角色、在岗状态与重复占位。
-- 导入数据前先进行安全审计；发现高风险错误时阻止导入并列出原因。
-- 不改变现有页面布局、颜色、操作入口和排班策略。
-
-
-## 弹性透析日班组优化
-
-在“医护优先”策略下，每周3次治疗的患者会在以下4种安全组合中自动选择：
-
-- 周一、周三、周五（1-3-5）
-- 周二、周四、周六（2-4-6）
-- 周一、周三、周六（1-3-6）
-- 周一、周四、周六（1-4-6）
-
-所有组合均保证任意相邻两次治疗之间至少完整间隔一天，并检查周六到下一周周一的跨周间隔。程序不会生成2-4-5、2-5-6等连续两天治疗的组合。
-
-优化目标按以下优先级执行：减少护士组总数、减少单人护士组、降低班组空余容量、减少开班日，最后才考虑尽量少改患者原日期。感染分区、严重组、治疗机型和班次倾向分别计算，不会为了合并班组而破坏隔离或机型规则。
-
-
-## 灵巧排班
-
-新增第三种排班策略“灵巧排班”。启用后：
-
-- 所有每周3次治疗的在透患者，统一在以下4种安全组合中自动选择：`1-3-5`、`2-4-6`、`1-3-6`、`1-4-6`；
-- 任意相邻两次治疗之间至少完整间隔一天，跨周也满足该规则；
-- 优先减少单人护士组、低负荷护士组和零散开班；
-- 同时继续遵守感染分区、严格机型、长期固定机位、暂停机器、重病区5人/护士、其他区6人/护士、每名护士最多1台血滤机等硬性规则；
-- 每周非3次治疗的患者继续按其治疗频次和可用工作日安排。
-
-“患者优先”和“医护优先”仍保留，可随时切换。
-
-
-## 灵巧排班优化结果提示
-
-成功使用“灵巧排班”保存长期周模板后，程序会自动弹出优化结果，显示调整患者数、治疗日期调整次数、班次调整次数，以及相较“患者优先”减少的开班班次、责任护士岗位、单人护士组和低负荷护士组。
-
-
-## 护士负担均衡优化
-
-当受固定机位、感染分区、机型、血滤机限制等条件影响，无法继续减少护士组数量时，系统会在“护士组总数不增加”的前提下，优先让各责任护士负责的患者人数更接近。
-
-例如原本可能出现：
-
-- 护士A：2人
-- 护士B：6人
-
-在机型和分区允许的情况下，系统会优先调整为：
-
-- 护士A：4人
-- 护士B：4人
-
-优化优先级为：
-
-1. 不增加护士组数量；
-2. 每名护士最多负责1台血滤机；
-3. 重病区最多5人、其他区域最多6人；
-4. 让各护士组人数尽量均衡；
-5. 在人数均衡的前提下，让机位尽量连续、相邻。
-
-若固定机位、传染分区或血滤机分布使均衡不可行，系统会保留安全约束，不会为了平均人数破坏硬性规则。
-
-
-## 第一阶段多语言支持
-
-标题旁新增语言选择器，内置24种语言：
-
-简体中文、繁体中文、英语、西班牙语、法语、阿拉伯语、俄语、葡萄牙语、德语、日语、韩语、意大利语、荷兰语、土耳其语、印地语、孟加拉语、乌尔都语、印尼语、越南语、泰语、波兰语、乌克兰语、波斯语、希伯来语。
-
-- 语言选择保存在本地，下次打开自动恢复；
-- 阿拉伯语、乌尔都语、波斯语和希伯来语支持从右到左布局；
-- 语言包独立存放于 `languages.js`；
-- 未经专业复核的长篇动态医疗安全提示暂时回退到英文，避免不可靠翻译造成误解。
-
-
-## 联系作者
-
-如有功能需求、使用建议或问题反馈，可联系：
-
-**434881918@qq.com**
-
-
-## 多语言第二阶段
-
-本阶段将第一批高风险动态文本接入语言包，包括：
-
-- 暂停机器与固定机位冲突；
-- 机型和感染分区不匹配；
-- 患者、医护保存与删除；
-- 周模板、单日排班、复制和清空；
-- 演示数据数量校验；
-- 机器布局与机位错误；
-- 导入、重置和关键确认提示。
-
-简体中文、繁体中文和英文已提供完整文本；其他语言在专业翻译完成前安全回退到英文。
-
-本批次实际替换动态调用：**49处**。
-
-
-## 多语言第三阶段：静态界面完整提取
-
-本阶段将 `index.html` 中全部可识别的静态中文界面文本迁移到语言包：
-
-- 实际提取并接入：**180项**
-- 覆盖标题、导航、按钮、表单、选项、说明、弹窗、占位符和辅助属性
-- 简体中文、繁体中文和英文已完整提供
-- 其他21种语言继续安全回退英文
-- 排班算法、数据结构和现有界面布局未改动
-
-
-## 多语言第四阶段：动态界面全覆盖
-
-本阶段新增运行时动态翻译层：
-
-- 自动翻译后续生成的卡片、护士管区、空状态、标签和统计文字；
-- 自动观察DOM变化，不需要逐个修改所有渲染函数；
-- `alert` 和 `confirm` 中遗留的中文文本自动翻译；
-- 精确文本与带数字的动态模板均支持；
-- 非中文语言缺少本地译文时统一回退英文；
-- 中文界面不受影响；
-- 排班算法与数据逻辑不变。
-
-
-## 护士责任区禁止跨排
-
-本版新增硬性规则：
-
-- 同一名责任护士的机器管区不得跨越不同物理机器排；
-- 即使上下两排机位相邻，也不会被视为同一个护理连续区域；
-- 每一排独立计算护士分组、人数上限和血滤机数量；
-- 同一排内仍优先保持机位相邻、负担均衡；
-- 旧缓存或异常布局也会在分组前按物理排强制拆分。
-
-例如：
-
-- 第5排的48、49、50号机不能与第6排的58、59、60号机组成同一护士组；
-- 第5排和第6排必须分别配置责任护士管区。
-
-
+本项目使用 MIT License。
