@@ -101,6 +101,7 @@
       <button class="ghost-button" id="saveTwoWeekTemplate" type="button">保存为长期2周循环模板</button>
       <button class="ghost-button" id="openTwoWeekReview" type="button">生成当前2周排班报告</button>
       <button class="ghost-button self-check-button" id="runScheduleSelfCheck" type="button">排班自检</button>
+      <button class="ghost-button self-check-button" id="openReleaseSafetyReport" type="button">发布前安全报告</button>
       <button class="ghost-button undo-button" id="undoLastChange" type="button" disabled>撤销上一步</button>
 </div>
 <button class="success-button shift-swap-button" id="openShiftSwap" type="button">智能调班</button>
@@ -261,6 +262,7 @@
 <section class="patient-list-panel">
 <div class="panel-header">
 <h2><span data-i18n="static_080">患者列表</span></h2>
+<button class="ghost-button" id="clearTemporaryPatients" type="button">清理过期临时患者</button>
 <input class="search-input compact" data-i18n-placeholder="static_175" id="patientSearch" placeholder="搜索患者" type="search"/>
 </div>
 <div class="patient-table-wrap">

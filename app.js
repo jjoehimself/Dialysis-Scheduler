@@ -296,6 +296,7 @@ function bindElements() {
     "saveTwoWeekTemplate",
     "openTwoWeekReview",
     "runScheduleSelfCheck",
+    "openReleaseSafetyReport",
     "undoLastChange",
     "cycleWeekTabs",
     "twoWeekReviewDialog",
@@ -378,6 +379,7 @@ function bindElements() {
     "patientNote",
     "deletePatient",
     "patientSearch",
+    "clearTemporaryPatients",
     "patientTableBody",
     "staffForm",
     "staffFormTitle",
@@ -492,6 +494,7 @@ function bindEvents() {
   ui.saveTwoWeekTemplate.addEventListener("click", saveTwoWeekCycleTemplate);
   ui.openTwoWeekReview.addEventListener("click", openStoredTwoWeekReview);
   ui.runScheduleSelfCheck.addEventListener("click", runScheduleSelfCheck);
+  ui.openReleaseSafetyReport.addEventListener("click", openReleaseSafetyReport);
   ui.undoLastChange.addEventListener("click", restoreLastUndoSnapshot);
   ui.closeTwoWeekReview.addEventListener("click", () => closeTwoWeekReview(false));
   ui.confirmTwoWeekPlan.addEventListener("click", () => closeTwoWeekReview(true));
@@ -521,6 +524,7 @@ function bindEvents() {
   ui.importData.addEventListener("change", importData);
   ui.resetAllData.addEventListener("click", resetAllData);
   ui.clearAllCache.addEventListener("click", clearAllAppCache);
+  ui.clearTemporaryPatients.addEventListener("click", clearExpiredTemporaryPatients);
   ui.openAboutDialog.addEventListener("click", () => ui.aboutDialog.showModal());
 
   ui.assignmentForm.addEventListener("submit", (event) => {
@@ -2309,6 +2313,12 @@ async function saveTwoWeekCycleTemplate({ showProgress = true } = {}) {
   }
   let undoCaptured = false;
   if (pendingTwoWeekPlan) {
+    const pendingReview = pendingTwoWeekPlan.review;
+    const selfCheck = buildScheduleSelfCheck(pendingReview, pendingTwoWeekPlan);
+    if (!confirmReleaseGateBeforeSave(pendingReview, selfCheck)) {
+      if (showProgress) await closeTaskProgress("发布前安全报告未通过", 0);
+      return;
+    }
     if (showProgress) await stepTaskProgress(18, "保存患者、医护和报告模板");
     undoCaptured = captureUndoSnapshot("保存长期2周循环模板");
     state.twoWeekCycle = {
@@ -2340,9 +2350,14 @@ async function saveTwoWeekCycleTemplate({ showProgress = true } = {}) {
       return;
     }
     if (showProgress) await stepTaskProgress(45, "重新整理当前2周报告");
-    undoCaptured = captureUndoSnapshot("保存长期2周循环模板");
     const currentReview = buildCurrentTwoWeekReview();
     if (currentReview) {
+      const selfCheck = buildScheduleSelfCheck(currentReview);
+      if (!confirmReleaseGateBeforeSave(currentReview, selfCheck)) {
+        if (showProgress) await closeTaskProgress("发布前安全报告未通过", 0);
+        return;
+      }
+      undoCaptured = captureUndoSnapshot("保存长期2周循环模板");
       state.twoWeekCycle.review = structuredClone(currentReview);
     }
     state.twoWeekCycle.anchorWeekStart = state.twoWeekCycle.anchorWeekStart || getAnchorWeekStartForActiveCycle();
@@ -2453,11 +2468,123 @@ async function runScheduleSelfCheck() {
   }
 }
 
-function buildScheduleSelfCheck(review) {
+async function openReleaseSafetyReport() {
+  if (ui.openReleaseSafetyReport.disabled) {
+    return;
+  }
+
+  ui.openReleaseSafetyReport.disabled = true;
+  showTaskProgress("正在生成发布前安全报告", "读取当前2周循环和临时患者记录", 8);
+  await waitForBrowserPaint();
+  try {
+    await stepTaskProgress(35, "执行患者、机位、血滤和医护安全门禁");
+    const review = buildCurrentTwoWeekReview();
+    if (!review) {
+      await closeTaskProgress("没有可发布检查的数据", 0);
+      window.alert("当前没有可生成发布前安全报告的2周排班，请先生成或保存2周排班。");
+      return;
+    }
+    const selfCheck = buildScheduleSelfCheck(review);
+    await stepTaskProgress(76, "整理护士长发布前复核清单");
+    showReleaseSafetyReportDialog(review, selfCheck, "发布前安全报告");
+    await closeTaskProgress("发布前安全报告已生成", 80);
+  } catch (error) {
+    await closeTaskProgress("发布前安全报告失败", 0);
+    showTwoWeekGenerationError(error, "生成发布前安全报告失败");
+  } finally {
+    ui.openReleaseSafetyReport.disabled = false;
+  }
+}
+
+function confirmReleaseGateBeforeSave(review, selfCheck) {
+  if (!review || !selfCheck) {
+    window.alert("发布前安全报告为空，已取消保存。请重新生成2周排班后再保存。");
+    return false;
+  }
+  if (selfCheck.blocking.length) {
+    showReleaseSafetyReportDialog(review, selfCheck, "保存前安全门禁");
+    window.alert(`发布前安全报告发现 ${selfCheck.blocking.length} 项阻止项，已取消保存长期2周循环模板。请先处理红色问题。`);
+    return false;
+  }
+  if (selfCheck.warnings.length) {
+    showReleaseSafetyReportDialog(review, selfCheck, "保存前安全门禁");
+    const approved = window.confirm(`发布前安全报告发现 ${selfCheck.warnings.length} 项提醒。请确认护士长已复核这些提醒，仍要保存长期2周循环模板吗？`);
+    if (approved && ui.twoWeekReviewDialog.open) {
+      ui.twoWeekReviewDialog.close();
+    }
+    return approved;
+  }
+  return true;
+}
+
+function showReleaseSafetyReportDialog(review, selfCheck, sourceLabel = "发布前安全报告") {
+  ui.twoWeekReviewTitle.textContent = selfCheck.blocking.length
+    ? "发布前安全报告：不得发布"
+    : selfCheck.warnings.length
+      ? "发布前安全报告：需护士长复核"
+      : "发布前安全报告：可以发布";
+  ui.twoWeekReviewMeta.innerHTML = renderReleaseSafetyMeta(selfCheck, sourceLabel);
+  ui.twoWeekReviewContent.innerHTML = `${renderReleaseSafetyReport(review, selfCheck)}${renderTwoWeekReview(review, false, selfCheck.assessment)}`;
+  ui.confirmTwoWeekPlan.hidden = true;
+  ui.confirmTwoWeekPlan.disabled = true;
+  ui.twoWeekReviewDialog.showModal();
+}
+
+function renderReleaseSafetyMeta(selfCheck, sourceLabel = "发布前安全报告") {
+  const chips = [
+    '<span class="two-week-review-meta-label">发布门禁</span>',
+    `<span class="two-week-review-chip source">${escapeHtml(sourceLabel)}</span>`,
+    `<span class="two-week-review-chip ${escapeHtml(selfCheck.tone)}">${escapeHtml(selfCheck.blocking.length ? "不得发布" : selfCheck.warnings.length ? "需复核" : "可以发布")}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.blocking.length ? "danger" : "ok"}">${escapeHtml(selfCheck.blocking.length ? `${selfCheck.blocking.length}项阻止` : "无阻止项")}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.warnings.length ? "warning" : "ok"}">${escapeHtml(selfCheck.warnings.length ? `${selfCheck.warnings.length}项提醒` : "无提醒")}</span>`,
+    `<span class="two-week-review-chip ${selfCheck.crossYear.ok ? "ok" : "warning"}">${escapeHtml(selfCheck.crossYear.ok ? "跨年通过" : "跨年需复核")}</span>`,
+  ];
+  return chips.join("");
+}
+
+function renderReleaseSafetyReport(review, selfCheck) {
+  const tempSummary = getTemporaryPatientSummary();
+  const releaseAdvice = selfCheck.blocking.length
+    ? "不能保存或发布长期2周循环模板。请先处理所有红色阻止项，再重新生成本报告。"
+    : selfCheck.warnings.length
+      ? "患者治疗、机位和血滤没有阻止项；护士长必须复核提醒项后，才建议保存为正式长期模板。"
+      : "患者治疗、血滤、机器分区、医护引用、跨年滚动和临时患者隔离检查均通过。";
+  const tempTone = tempSummary.expiredCount ? "warning" : "ok";
+  const tempDetail = tempSummary.totalCount
+    ? `临时患者 ${tempSummary.totalCount} 名；当前或未来仍有排班 ${tempSummary.activeCount} 名；可清理过期 ${tempSummary.expiredCount} 名。`
+    : "当前没有临时患者。";
+  const checklist = [
+    { label: "发布建议", value: selfCheck.blocking.length ? "不得发布" : selfCheck.warnings.length ? "需复核" : "可以发布", detail: releaseAdvice, tone: selfCheck.tone },
+    { label: "患者治疗", value: `${review.stats.treatmentCount}/${review.stats.expectedTreatmentCount || review.stats.treatmentCount}`, detail: `${review.stats.patientCount} 名患者纳入2周循环`, tone: selfCheck.cards[0]?.tone || "ok" },
+    { label: "血滤目标", value: `${review.stats.hdfActualCount}/${review.stats.hdfTargetCount}`, detail: review.stats.hdfActualCount === review.stats.hdfTargetCount ? "目标一致" : "需要复核", tone: review.stats.hdfActualCount === review.stats.hdfTargetCount ? "ok" : "warning" },
+    { label: "临时患者", value: tempSummary.totalCount ? `${tempSummary.totalCount}名` : "无", detail: tempDetail, tone: tempTone },
+  ];
+  return `
+    <section class="self-check-summary ${escapeHtml(selfCheck.tone)}">
+      <div class="self-check-heading">
+        <span>最终发布前</span>
+        <h3>${escapeHtml(selfCheck.blocking.length ? "暂不能发布" : selfCheck.warnings.length ? "需要护士长复核后发布" : "可以发布")}</h3>
+        <p>${escapeHtml(releaseAdvice)}</p>
+      </div>
+      <div class="self-check-card-grid">
+        ${checklist.map((card) => `
+          <article class="${escapeHtml(card.tone || "ok")}">
+            <span>${escapeHtml(card.label)}</span>
+            <strong>${escapeHtml(card.value)}</strong>
+            <em>${escapeHtml(card.detail)}</em>
+          </article>
+        `).join("")}
+      </div>
+      ${renderSelfCheckSummary(selfCheck)}
+    </section>
+  `;
+}
+
+function buildScheduleSelfCheck(review, scheduleSource = {}) {
   const scheduledPatients = review.patientRows.filter((row) => row.sessions.length > 0).length;
   const hdfMatched = review.stats.hdfTargetCount === review.stats.hdfActualCount;
   const assessment = buildTwoWeekRunAssessment(review, scheduledPatients, hdfMatched);
-  const safety = collectCurrentTwoWeekSafetyFindings();
+  const safety = collectCurrentTwoWeekSafetyFindings(scheduleSource.patientSchedules, scheduleSource.staffSchedules);
   const forcePreferredWarnings = collectForcedPreferredDayWarnings(review);
   const staffWarnings = collectStaffRestWarnings(review);
   const crossYear = buildCrossYearCycleCheck();
@@ -2522,11 +2649,11 @@ function buildScheduleSelfCheck(review) {
   };
 }
 
-function collectCurrentTwoWeekSafetyFindings() {
-  const patientWeek1 = structuredClone(state.twoWeekCycle?.patientSchedules?.week1 || {});
-  const patientWeek2 = structuredClone(state.twoWeekCycle?.patientSchedules?.week2 || {});
-  const staffWeek1 = structuredClone(state.twoWeekCycle?.staffSchedules?.week1 || {});
-  const staffWeek2 = structuredClone(state.twoWeekCycle?.staffSchedules?.week2 || {});
+function collectCurrentTwoWeekSafetyFindings(patientSchedules = state.twoWeekCycle?.patientSchedules, staffSchedules = state.twoWeekCycle?.staffSchedules) {
+  const patientWeek1 = structuredClone(patientSchedules?.week1 || {});
+  const patientWeek2 = structuredClone(patientSchedules?.week2 || {});
+  const staffWeek1 = structuredClone(staffSchedules?.week1 || {});
+  const staffWeek2 = structuredClone(staffSchedules?.week2 || {});
   const errors = [
     ...validateGeneratedWeeklySafety(patientWeek1, staffWeek1).map((item) => `第1周：${item}`),
     ...validateGeneratedWeeklySafety(patientWeek2, staffWeek2).map((item) => `第2周：${item}`),
@@ -6166,6 +6293,65 @@ function removePatientFromScheduleCollection(scheduleCollection, patientId) {
       pruneEmptySchedule(scheduleCollection, key, machineId);
     });
   });
+}
+
+function getTemporaryPatientSummary(today = formatDateInput(new Date())) {
+  const temporaryPatients = state.patients.filter((patient) => patient.temporaryInsert);
+  const expiredPatients = getExpiredTemporaryPatients(today);
+  const activeCount = temporaryPatients.filter((patient) => hasPatientScheduleOnOrAfter(patient.id, today)).length;
+  return {
+    totalCount: temporaryPatients.length,
+    activeCount,
+    expiredCount: expiredPatients.length,
+    expiredPatients,
+  };
+}
+
+function getExpiredTemporaryPatients(today = formatDateInput(new Date())) {
+  return state.patients.filter((patient) =>
+    patient.temporaryInsert && !hasPatientScheduleOnOrAfter(patient.id, today)
+  );
+}
+
+function hasPatientScheduleOnOrAfter(patientId, dateValue) {
+  return Object.entries(state.schedules || {}).some(([date, daySchedule]) => {
+    if (date < dateValue) {
+      return false;
+    }
+    return Object.values(daySchedule || {}).some((machine) =>
+      STAFF_SHIFT_KEYS.some((shift) => machine?.[shift]?.patientId === patientId)
+    );
+  });
+}
+
+function clearExpiredTemporaryPatients() {
+  const expiredPatients = getExpiredTemporaryPatients();
+  if (!expiredPatients.length) {
+    showToast("没有可清理的过期临时患者");
+    return;
+  }
+  const preview = expiredPatients
+    .slice(0, 12)
+    .map((patient) => `- ${patient.name}${patient.dialysisNo ? `（${patient.dialysisNo}）` : ""}`)
+    .join("\n");
+  const hidden = expiredPatients.length > 12 ? `\n- 其余 ${expiredPatients.length - 12} 名未显示` : "";
+  if (!window.confirm(`将清理 ${expiredPatients.length} 名已过期且当前/未来没有排班的临时患者：\n\n${preview}${hidden}\n\n继续吗？`)) {
+    return;
+  }
+  captureUndoSnapshot("清理过期临时患者");
+  const expiredIds = new Set(expiredPatients.map((patient) => patient.id));
+  expiredIds.forEach((patientId) => removePatientFromSchedules(patientId));
+  state.patients = state.patients.filter((patient) => !expiredIds.has(patient.id));
+  if (expiredIds.has(ui.patientId.value)) {
+    resetPatientForm();
+  }
+  saveState();
+  renderPatientTable();
+  renderWeekNavigation();
+  renderStaffSchedule();
+  renderSchedule();
+  renderSummary();
+  showToast(`已清理 ${expiredPatients.length} 名过期临时患者`);
 }
 
 function renderPatientTable() {
